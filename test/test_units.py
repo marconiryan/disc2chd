@@ -70,5 +70,11 @@ def test_max_chdman_memory_parsing():
     for bad in ("", "abc", "4X", "100"):
         with pytest.raises(Exception):
             m.parse_size(bad)
-    assert m.default_memory_limit(1) <= 4 << 30
-    assert m.default_memory_limit(64) <= m.default_memory_limit(1)
+
+
+def test_default_memory_limit_is_half_the_ram_per_job(monkeypatch):
+    monkeypatch.setattr(m, "mem_total", lambda: 64 << 30)
+    assert m.default_memory_limit(1) == 32 << 30      # no 4 GiB cap
+    assert m.default_memory_limit(4) == 8 << 30
+    monkeypatch.setattr(m, "mem_total", lambda: None)
+    assert m.default_memory_limit(1) is None

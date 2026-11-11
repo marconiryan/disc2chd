@@ -271,7 +271,6 @@ NO_FLAC_EXPLANATION = (
     "attempt next time, use --compression %s (or %s for CD images)."
     % (NO_FLAC_CODECS[DVD], NO_FLAC_CODECS[CD]))
 GIB = 1 << 30
-DEFAULT_MEMORY_CAP = 4 * GIB
 
 
 def ext_of(path: str) -> str:
@@ -332,11 +331,11 @@ def mem_total() -> int | None:
     return None
 
 
-def default_memory_limit(jobs: int) -> int:
+def default_memory_limit(jobs: int) -> int | None:
+    """Half the RAM, shared between the parallel jobs. None (no watchdog)
+    when the total RAM is unknown."""
     total = mem_total()
-    if not total:
-        return DEFAULT_MEMORY_CAP
-    return min(DEFAULT_MEMORY_CAP, total // (2 * max(1, jobs)))
+    return total // (2 * max(1, jobs)) if total else None
 
 
 def read_rss(pid: int) -> int | None:
@@ -2030,8 +2029,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="chdman codecs (passed as -c)")
     p.add_argument("--max-chdman-memory", metavar="SIZE", type=parse_size,
                    help="stop chdman when its memory use goes over SIZE (e.g. 4G, 512M) and "
-                        "retry without FLAC (default: 4G or half the RAM divided by --jobs, "
-                        "whichever is smaller)")
+                        "retry without FLAC (default: half the RAM divided by --jobs)")
     p.add_argument("--hunk-size", metavar="BYTES", type=positive_int,
                    help="chdman hunk size (passed as -hs)")
     p.add_argument("--threads", metavar="N", type=positive_int,
@@ -2204,7 +2202,8 @@ def run(args) -> int:
     log.write("disc2chd %s; chdman %s %s; 7-Zip %s %s" % (
         VERSION, deps.chdman.path, deps.chdman.version, deps.sevenzip.path, deps.sevenzip.version))
     log.write("Arguments: %s" % " ".join(sys.argv[1:]))
-    log.write("chdman memory limit: %s" % fmt_binary(args.max_chdman_memory))
+    log.write("chdman memory limit: %s" % (fmt_binary(args.max_chdman_memory)
+                                           if args.max_chdman_memory else "none (total RAM unknown)"))
     for line in plan_lines(plan, deps, args, True) if not args.verify_only else []:
         log.write(line)
     workspace = Workspace(args.temp_dir)
