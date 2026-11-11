@@ -13,10 +13,18 @@ if sys.version_info < MIN_PYTHON:
     sys.exit(3)
 
 import argparse
+import concurrent.futures
+import fcntl
+import hashlib
 import os
 import re
+import selectors
 import shutil
+import signal
 import subprocess
+import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 
 VERSION = "1.0.0"
@@ -362,6 +370,7 @@ class Disc:
     index: int = 0
     chd_size: int = 0
     seconds: float = 0.0
+    started: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -381,6 +390,8 @@ class Job:
     archive: str | None = None
     members: list[tuple[str, int]] = field(default_factory=list)
     verify_chd: str | None = None     # --verify-only jobs
+    error: str = ""                   # why extraction failed
+    error_status: str = FAILED_EXTRACT
 
     @property
     def unpacked_size(self) -> int:
@@ -741,6 +752,859 @@ def risky_roots(roots: list[str]) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Run state, child processes and signals
+# --------------------------------------------------------------------------
+
+class Interrupted(Exception):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+class JobTimeout(Exception):
+    pass
+
+
+class RunState:
+    def __init__(self):
+        self.interrupted = 0
+        self.lock = threading.Lock()
+        self.procs: set = set()
+        self.in_progress: set = set()    # .part files and temp dirs to remove on interrupt
+
+    def add_proc(self, proc) -> None:
+        with self.lock:
+            self.procs.add(proc)
+
+    def drop_proc(self, proc) -> None:
+        with self.lock:
+            self.procs.discard(proc)
+
+    def kill_all(self) -> None:
+        with self.lock:
+            procs = list(self.procs)
+        for proc in procs:
+            kill_tree(proc)
+
+    def track(self, path: str) -> None:
+        with self.lock:
+            self.in_progress.add(path)
+
+    def untrack(self, path: str) -> None:
+        with self.lock:
+            self.in_progress.discard(path)
+
+    def remove_tracked(self) -> None:
+        with self.lock:
+            paths = list(self.in_progress)
+        for path in paths:
+            remove_path(path)
+
+    def check(self) -> None:
+        if self.interrupted:
+            raise Interrupted(self.interrupted)
+
+
+STATE = RunState()
+
+
+def kill_tree(proc) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def remove_path(path: str) -> None:
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.lexists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _make_pdeathsig():
+    """Ask the kernel to kill children if disc2chd itself dies (kill -9)."""
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError, ImportError):
+        return None
+
+    def setup() -> None:
+        prctl(1, int(signal.SIGKILL))   # PR_SET_PDEATHSIG
+    return setup
+
+
+PDEATHSIG = _make_pdeathsig()
+PCT_RE = re.compile(r"(-?nan|\d+(?:\.\d+)?)%\s+complete", re.IGNORECASE)
+
+
+@dataclass
+class RunResult:
+    rc: int
+    lines: list[str]
+    nan: bool = False
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def last_message(self) -> str:
+        skip = ("chdman - MAME", "Fatal error occurred", "7-Zip ")
+        msgs = [l.strip() for l in self.lines if l.strip() and not l.startswith(skip)]
+        return msgs[-1] if msgs else "no output"
+
+
+def run_tool(cmd: list[str], deadline: float | None, log, display,
+             progress=None, tick=None) -> RunResult:
+    """Run a child process, streaming its \\r/\\n separated output.
+
+    progress(fraction) is called for every 'NN% complete' line; tick() is
+    called about five times per second. Raises JobTimeout / Interrupted.
+    """
+    log.write("  $ " + " ".join(shlex_quote(c) for c in cmd))
+    display.command(cmd)
+    started = time.monotonic()
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True,
+                            preexec_fn=PDEATHSIG)
+    STATE.add_proc(proc)
+    lines: list[str] = []
+    nan = timed_out = False
+    buf = b""
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+
+    def handle(segment: bytes) -> None:
+        nonlocal nan
+        text = segment.decode("utf-8", "replace")
+        m = PCT_RE.search(text)
+        if m:
+            if "nan" in m.group(1).lower():
+                if not nan:
+                    nan = True
+                    kill_tree(proc)
+            elif progress:
+                progress(min(1.0, float(m.group(1)) / 100.0))
+            return
+        if text.strip() and len(lines) < 5000:
+            lines.append(text.rstrip())
+
+    try:
+        while True:
+            if STATE.interrupted:
+                kill_tree(proc)
+            if deadline is not None and not timed_out and time.monotonic() > deadline:
+                timed_out = True
+                kill_tree(proc)
+            if sel.select(0.2):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                parts = re.split(rb"[\r\n]", buf)
+                buf = parts.pop()
+                for part in parts:
+                    handle(part)
+            if tick:
+                tick()
+        if buf:
+            handle(buf)
+        proc.wait()
+    finally:
+        sel.close()
+        proc.stdout.close()
+        if proc.poll() is None:
+            kill_tree(proc)
+            proc.wait()
+        STATE.drop_proc(proc)
+    log.write("    exit %s after %s" % (proc.returncode, fmt_duration(time.monotonic() - started)))
+    STATE.check()
+    if timed_out:
+        raise JobTimeout()
+    return RunResult(proc.returncode, lines, nan)
+
+
+# --------------------------------------------------------------------------
+# Log file
+# --------------------------------------------------------------------------
+
+def state_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "disc2chd")
+
+
+class Log:
+    def __init__(self, path: str | None):
+        self.path = path
+        self.lock = threading.Lock()
+        self.fh = None
+        if path:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self.fh = open(path, "a", encoding="utf-8")
+
+    @classmethod
+    def open_default(cls, explicit: str | None) -> "Log":
+        if explicit:
+            return cls(explicit)
+        folder = os.path.join(state_dir(), "logs")
+        os.makedirs(folder, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(folder, "disc2chd-%s.log" % stamp)
+        n = 1
+        while os.path.exists(path):
+            path = os.path.join(folder, "disc2chd-%s-%d.log" % (stamp, n))
+            n += 1
+        return cls(path)
+
+    def write(self, msg: str) -> None:
+        if not self.fh:
+            return
+        with self.lock:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for line in msg.splitlines() or [""]:
+                self.fh.write("%s %s\n" % (stamp, line))
+            self.fh.flush()
+
+    def close(self) -> None:
+        if self.fh:
+            self.fh.close()
+
+
+class NullLog(Log):
+    def __init__(self):
+        super().__init__(None)
+
+
+# --------------------------------------------------------------------------
+# Temporary folders and stale-file cleanup
+# --------------------------------------------------------------------------
+
+class Workspace:
+    """Per-run hidden folders named .disc2chd-tmp-<pid>.
+
+    Each one holds a locked '.lock' file while this run is alive, so a later
+    run can tell a live folder from one left behind by a crash.
+    """
+
+    def __init__(self, temp_dir: str | None):
+        self.temp_dir = os.path.abspath(temp_dir) if temp_dir else None
+        self.dirs: dict[str, tuple[str, int]] = {}
+        self.lock = threading.Lock()
+
+    def _marker(self, parent: str) -> str:
+        with self.lock:
+            if parent in self.dirs:
+                return self.dirs[parent][0]
+            os.makedirs(parent, exist_ok=True)
+            path = os.path.join(parent, "%s%d" % (TEMP_PREFIX, os.getpid()))
+            os.makedirs(path, exist_ok=True)
+            fd = os.open(os.path.join(path, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.dirs[parent] = (path, fd)
+            return path
+
+    def job_dir(self, out_dir: str) -> str:
+        base = self._marker(out_dir)
+        if self.temp_dir:
+            base = self._marker(self.temp_dir)
+        path = tempfile.mkdtemp(prefix="job-", dir=base)
+        STATE.track(path)
+        return path
+
+    def close(self) -> None:
+        with self.lock:
+            items = list(self.dirs.values())
+            self.dirs.clear()
+        for path, fd in items:
+            shutil.rmtree(path, ignore_errors=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def temp_dir_is_live(path: str) -> bool:
+    lock = os.path.join(path, ".lock")
+    if os.path.exists(lock):
+        try:
+            fd = os.open(lock, os.O_RDWR)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+    m = re.search(r"(\d+)$", path)
+    if not m:
+        return False
+    try:
+        os.kill(int(m.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return int(m.group(1)) != os.getpid()
+
+
+def clean_stale(folders: list[str], recursive: bool, log) -> list[str]:
+    """Remove *.chd.part files and .disc2chd-tmp-* folders left by crashed runs."""
+    removed: list[str] = []
+    seen: set[str] = set()
+    for top in folders:
+        if not os.path.isdir(top):
+            continue
+        for dirpath, dirnames, filenames in os.walk(top):
+            real = os.path.realpath(dirpath)
+            if real in seen:
+                dirnames[:] = []
+                continue
+            seen.add(real)
+            live_here = False
+            for d in [d for d in dirnames if TEMP_DIR_RE.match(d)]:
+                path = os.path.join(dirpath, d)
+                if temp_dir_is_live(path):
+                    live_here = True
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed.append(path)
+            if not live_here:
+                for name in filenames:
+                    if name.lower().endswith(".chd.part"):
+                        path = os.path.join(dirpath, name)
+                        remove_path(path)
+                        removed.append(path)
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".")) if recursive else []
+    for path in removed:
+        log.write("Removed leftover from an earlier run: %s" % path)
+    return removed
+
+
+# --------------------------------------------------------------------------
+# CHD checks and hashing
+# --------------------------------------------------------------------------
+
+ZERO_SHA1 = "0" * 40
+
+
+@dataclass
+class ChdInfo:
+    data_sha1: str | None
+    tags: list[str]
+    tracks: int
+
+
+def chd_info(chdman: str, path: str, deadline, log, display) -> tuple[ChdInfo | None, str]:
+    res = run_tool([chdman, "info", "-i", path], deadline, log, display)
+    if res.rc != 0:
+        return None, "chdman info exited %d: %s" % (res.rc, res.last_message())
+    text = res.text
+    m = re.search(r"^Data SHA1:\s*([0-9a-fA-F]{40})", text, re.MULTILINE)
+    return ChdInfo(m.group(1).lower() if m else None,
+                   re.findall(r"Tag='([^']*)'", text),
+                   len(re.findall(r"TRACK:\d+", text))), ""
+
+
+def check_chd(chdman: str, path: str, kind: str | None, tracks: int, deadline,
+              log, display, progress=None) -> tuple[bool, str, ChdInfo | None]:
+    """Integrity checks (steps 2 and 3): chdman verify plus chdman info."""
+    res = run_tool([chdman, "verify", "-i", path], deadline, log, display, progress=progress)
+    text = res.text
+    if "No verification to be done" in text:
+        return False, "CHD has no checksum (incomplete file from an interrupted run)", None
+    if res.rc != 0:
+        return False, "chdman verify exited %d: %s" % (res.rc, res.last_message()), None
+    if "Overall SHA1 verification successful!" not in text:
+        return False, "chdman verify did not report success", None
+    info, reason = chd_info(chdman, path, deadline, log, display)
+    if info is None:
+        return False, reason, None
+    if not info.data_sha1:
+        return False, "chdman info shows no Data SHA1", info
+    if info.data_sha1 == ZERO_SHA1:
+        return False, "Data SHA1 is all zeros (incomplete file)", info
+    if kind == DVD and "DVD " not in info.tags:
+        return False, "not a DVD CHD (tags: %s)" % ", ".join(info.tags), info
+    if kind == CD:
+        if "CHT2" not in info.tags:
+            return False, "not a CD CHD (tags: %s)" % ", ".join(info.tags), info
+        if tracks and info.tracks != tracks:
+            return False, "CHD has %d tracks, cue has %d" % (info.tracks, tracks), info
+    if kind is None and "DVD " not in info.tags and "CHT2" not in info.tags:
+        return False, "not a DVD or CD CHD (tags: %s)" % ", ".join(info.tags), info
+    log.write("    verify OK; Data SHA1 %s; tags %s; tracks %d"
+              % (info.data_sha1, ",".join(t.strip() for t in info.tags), info.tracks))
+    return True, "", info
+
+
+def sha1_files(paths: list[str], deadline, progress=None) -> str:
+    """SHA1 of the files concatenated, read in 8 MiB chunks (nothing is written)."""
+    h = hashlib.sha1()
+    done = 0
+    for path in paths:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(8 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+                done += len(chunk)
+                STATE.check()
+                if deadline is not None and time.monotonic() > deadline:
+                    raise JobTimeout()
+                if progress:
+                    progress(done)
+    return h.hexdigest()
+
+
+def folder_bytes(path: str) -> int:
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def same_device(a: str, b: str) -> bool:
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return True
+
+
+def space_problem(temp_bytes: int, out_bytes: int, temp_dir: str, out_dir: str) -> str | None:
+    """Check free space with a 5% margin. Returns a message when short."""
+    temp_need = int(temp_bytes * 1.05)
+    out_need = int(out_bytes * 1.05)
+    if same_device(temp_dir, out_dir):
+        need, free = temp_need + out_need, free_space(out_dir)
+        if free < need:
+            return "need %s, only %s free in %s" % (fmt_size(need), fmt_size(free), out_dir)
+        return None
+    for need, folder in ((temp_need, temp_dir), (out_need, out_dir)):
+        free = free_space(folder)
+        if free < need:
+            return "need %s, only %s free in %s" % (fmt_size(need), fmt_size(free), folder)
+    return None
+
+
+def publish(part: str, final: str) -> bool:
+    """Move part to final without ever overwriting an existing file."""
+    try:
+        os.link(part, final)
+    except FileExistsError:
+        return False
+    except OSError:
+        if os.path.exists(final):
+            return False
+        os.replace(part, final)
+        return True
+    os.unlink(part)
+    return True
+
+
+def write_fixed_cue(disc: Disc, real_paths: list[str], folder: str) -> str:
+    """Copy of the cue whose FILE lines point to the real files.
+
+    chdman joins the cue's folder with the FILE value even when that value is
+    absolute, so the paths are written relative to the new cue's folder.
+    """
+    lines = list(disc.cue.lines)
+    for idx, real in zip(disc.cue.file_line_index, real_paths):
+        rel = os.path.relpath(os.path.abspath(real), folder)
+        if '"' in rel:
+            raise ValueError("file name contains a double quote: %s" % real)
+        lines[idx] = 'FILE "%s" BINARY' % rel
+    path = os.path.join(folder, "fixed.cue")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+# --------------------------------------------------------------------------
+# Processing
+# --------------------------------------------------------------------------
+
+class Processor:
+    def __init__(self, args, deps: Deps, display, log, workspace: Workspace,
+                 keep_archives: set[str]):
+        self.args = args
+        self.chdman = deps.chdman.path
+        self.sevenzip = deps.sevenzip.path
+        self.display = display
+        self.log = log
+        self.ws = workspace
+        self.keep_archives = keep_archives
+        self.timeout = args.timeout * 60.0
+
+    # -- helpers ----------------------------------------------------------
+
+    def finish(self, disc: Disc, status: str, reason: str = "") -> None:
+        disc.status, disc.reason = status, reason
+        if disc.started:
+            disc.seconds = time.monotonic() - disc.started
+        self.log.write("[%s] %s%s" % (status, disc.label(), (": " + reason) if reason else ""))
+        self.display.result(disc)
+
+    def phase_cb(self, disc: Disc, name: str, total: int | None = None):
+        self.display.phase(disc, name, 0.0)
+        if total:
+            return lambda done: self.display.phase(disc, name, done / float(total))
+        return lambda frac: self.display.phase(disc, name, frac)
+
+    # -- jobs ---------------------------------------------------------------
+
+    def run_job(self, job: Job) -> None:
+        if job.verify_chd:
+            self.verify_existing_only(job.discs[0])
+            return
+        extracted: dict[str, str] | None = None
+        job_tmp = None
+        try:
+            for disc in job.discs:
+                if disc.status is not None:
+                    continue
+                self.display.header(disc)
+                for w in disc.warnings:
+                    self.display.warn(w)
+                    self.log.write("  warning: " + w)
+                started = disc.started = time.monotonic()
+                deadline = started + self.timeout
+                try:
+                    if os.path.exists(disc.final) and self.existing_is_valid(disc, deadline):
+                        disc.chd_size = os.path.getsize(disc.final)
+                        disc.seconds = time.monotonic() - started
+                        self.finish(disc, SKIPPED_EXISTS, "valid CHD already present")
+                        continue
+                    if job.archive:
+                        if extracted is None:
+                            job_tmp = self.ws.job_dir(os.path.dirname(disc.final))
+                            extracted = self.extract(job, disc, job_tmp)
+                        if not extracted:
+                            self.finish(disc, job.error_status, job.error or "extraction failed")
+                            continue
+                    self.convert(disc, extracted, deadline)
+                except JobTimeout:
+                    self.finish(disc, FAILED_TIMEOUT, "took longer than %s" % fmt_duration(self.timeout))
+                finally:
+                    disc.seconds = time.monotonic() - started
+                    self.display.disc_done(disc)
+        finally:
+            if job_tmp:
+                remove_path(job_tmp)
+                STATE.untrack(job_tmp)
+        self.dispose_sources(job)
+
+    def existing_is_valid(self, disc: Disc, deadline: float) -> bool:
+        self.log.write("Checking existing %s" % disc.final)
+        ok, reason, _ = check_chd(self.chdman, disc.final, disc.kind, disc.tracks, deadline,
+                                  self.log, self.display, self.phase_cb(disc, "verify"))
+        if ok:
+            return True
+        bad = "%s.invalid-%s" % (disc.final, time.strftime("%Y%m%d-%H%M%S"))
+        os.rename(disc.final, bad)
+        msg = "existing CHD is invalid (%s); renamed to %s" % (reason, os.path.basename(bad))
+        self.log.write("  " + msg)
+        self.display.warn(msg)
+        return False
+
+    def extract(self, job: Job, disc: Disc, tmp: str) -> dict[str, str]:
+        out_dir = os.path.dirname(disc.final)
+        pending = [d for d in job.discs if d.status is None]
+        compare = 0 if self.args.fast_verify else max([d.size for d in pending if d.kind == CD] or [0])
+        problem = space_problem(job.unpacked_size + compare, sum(d.size for d in pending), tmp, out_dir)
+        if problem:
+            job.error_status, job.error = FAILED_NO_SPACE, problem
+            return {}
+        total = max(1, job.unpacked_size)
+        update = self.phase_cb(disc, "extract", total)
+        last = [0.0]
+
+        def tick() -> None:
+            now = time.monotonic()
+            if now - last[0] >= 0.5:
+                last[0] = now
+                update(min(total, folder_bytes(tmp)))
+
+        self.log.write("Extracting %s (%s unpacked)" % (job.archive, fmt_size(job.unpacked_size)))
+        res = run_tool([self.sevenzip, "x", "-y", "-bd", "-o" + tmp, "--", job.archive],
+                       time.monotonic() + self.timeout, self.log, self.display, tick=tick)
+        if res.rc != 0:
+            job.error = "7-Zip exited %d: %s" % (res.rc, res.last_message())
+            return {}
+        mapping = {}
+        for d in pending:
+            for member in [d.image] + d.data_files:
+                path = os.path.join(tmp, *member.replace("\\", "/").split("/"))
+                if not os.path.isfile(path):
+                    job.error = "member missing after extraction: %s" % member
+                    return {}
+                mapping[member] = path
+        return mapping
+
+    def convert(self, disc: Disc, extracted: dict[str, str] | None, deadline: float) -> None:
+        args = self.args
+        out_dir = os.path.dirname(disc.final)
+        os.makedirs(out_dir, exist_ok=True)
+        part = disc.final + ".part"
+        source = extracted[disc.image] if extracted else disc.image
+        data_files = [extracted[f] for f in disc.data_files] if extracted else list(disc.data_files)
+        tmp = None
+        STATE.track(part)
+        try:
+            remove_path(part)
+            problem = space_problem(0 if args.fast_verify or disc.kind == DVD else disc.size,
+                                    disc.size, out_dir, out_dir)
+            if problem:
+                self.finish(disc, FAILED_NO_SPACE, problem)
+                return
+            if disc.kind == CD and (disc.case_fixed or not args.fast_verify):
+                tmp = self.ws.job_dir(out_dir)
+            if disc.kind == CD and disc.case_fixed:
+                source = write_fixed_cue(disc, data_files, tmp)
+            self.log.write("Converting %s (%s, %s)\n  source: %s\n  data files: %s" % (
+                disc.label(), disc.kind, fmt_size(disc.size), source, ", ".join(data_files)))
+            cmd = chdman_create_cmd(self.chdman, disc.kind, os.path.abspath(source), part, args)
+            t0 = time.monotonic()
+            res = run_tool(cmd, deadline, self.log, self.display,
+                           progress=self.phase_cb(disc, "convert"))
+            self.log.write("  convert took %s" % fmt_duration(time.monotonic() - t0))
+            if res.nan:
+                self.finish(disc, FAILED_CHDMAN, "chdman stalled (progress showed -nan%) and was stopped")
+                return
+            if res.rc != 0 or not os.path.isfile(part):
+                self.finish(disc, FAILED_CHDMAN, "chdman exited %d: %s" % (res.rc, res.last_message()))
+                return
+            ok, reason, info = check_chd(self.chdman, part, disc.kind, disc.tracks, deadline,
+                                         self.log, self.display, self.phase_cb(disc, "verify"))
+            if not ok:
+                self.finish(disc, FAILED_VERIFY, reason)
+                return
+            status, note = OK, ""
+            if not args.fast_verify:
+                status, note = self.compare(disc, part, info, data_files, tmp, deadline)
+                if status not in SUCCESS:
+                    self.finish(disc, status, note)
+                    return
+            else:
+                self.log.write("  comparison with the source skipped (--fast-verify)")
+            if not publish(part, disc.final):
+                self.finish(disc, FAILED_NAME_COLLISION,
+                            "%s appeared during conversion; not overwritten" % disc.final)
+                return
+            disc.chd_size = os.path.getsize(disc.final)
+            self.log.write("  sizes: %d -> %d bytes (%.1f%%)" % (
+                disc.size, disc.chd_size, 100.0 * disc.chd_size / max(1, disc.size)))
+            self.finish(disc, status, note)
+        finally:
+            remove_path(part)
+            STATE.untrack(part)
+            if tmp:
+                remove_path(tmp)
+                STATE.untrack(tmp)
+
+    def compare(self, disc: Disc, part: str, info: ChdInfo, data_files: list[str],
+                tmp: str | None, deadline: float) -> tuple[str, str]:
+        """Step 4: compare the CHD content with the source."""
+        src_sha = sha1_files(data_files, deadline,
+                             self.phase_cb(disc, "hash source", max(1, disc.size)))
+        self.log.write("  source SHA1: %s" % src_sha)
+        if disc.kind == DVD:
+            self.display.phase(disc, "compare", 1.0)
+            if src_sha != info.data_sha1:
+                return FAILED_HASH_MISMATCH, "CHD Data SHA1 %s != ISO SHA1 %s" % (info.data_sha1, src_sha)
+            self.log.write("  CHD Data SHA1 equals the ISO SHA1")
+            return OK, ""
+        cue_out = os.path.join(tmp, "compare.cue")
+        bin_out = os.path.join(tmp, "compare.bin")
+        try:
+            res = run_tool([self.chdman, "extractcd", "-i", part, "-o", cue_out, "-ob", bin_out, "-f"],
+                           deadline, self.log, self.display,
+                           progress=self.phase_cb(disc, "extract for compare"))
+            if res.rc != 0 or not os.path.isfile(bin_out):
+                return FAILED_VERIFY, "chdman extractcd exited %d: %s" % (res.rc, res.last_message())
+            chd_sha = sha1_files([bin_out], deadline,
+                                 self.phase_cb(disc, "compare", max(1, os.path.getsize(bin_out))))
+        finally:
+            remove_path(cue_out)
+            remove_path(bin_out)
+        self.log.write("  extracted SHA1: %s" % chd_sha)
+        if chd_sha == src_sha:
+            self.log.write("  extracted data equals the source bins in cue order")
+            return OK, ""
+        if disc.has_gaps:
+            note = ("extracted data differs from the source bins; the cue uses PREGAP/POSTGAP, "
+                    "which chdman may store differently. Internal CHD checks passed.")
+            self.log.write("  " + note)
+            return OK_INTERNAL_ONLY, note
+        return FAILED_HASH_MISMATCH, "extracted SHA1 %s != source SHA1 %s" % (chd_sha, src_sha)
+
+    def verify_existing_only(self, disc: Disc) -> None:
+        self.display.header(disc)
+        started = disc.started = time.monotonic()
+        try:
+            ok, reason, _ = check_chd(self.chdman, disc.image, None, 0,
+                                      started + self.timeout, self.log, self.display,
+                                      self.phase_cb(disc, "verify"))
+            disc.chd_size = disc.size
+            disc.seconds = time.monotonic() - started
+            self.finish(disc, OK if ok else FAILED_VERIFY, reason)
+        except JobTimeout:
+            self.finish(disc, FAILED_TIMEOUT, "took longer than %s" % fmt_duration(self.timeout))
+        self.display.disc_done(disc)
+
+    def dispose_sources(self, job: Job) -> None:
+        args = self.args
+        if not (args.move_source_to or args.delete_source):
+            return
+        if any(d.status != OK for d in job.discs) or job.archive in self.keep_archives:
+            self.log.write("Sources kept for %s (not every disc is OK)" % (job.archive or job.discs[0].image))
+            return
+        if job.archive:
+            paths = [job.archive]
+        else:
+            paths = []
+            for d in job.discs:
+                for p in [d.image] + d.data_files:
+                    if p not in paths:
+                        paths.append(p)
+        for path in paths:
+            try:
+                if args.delete_source:
+                    os.remove(path)
+                    self.log.write("Deleted source %s" % path)
+                    continue
+                rel = os.path.relpath(path, job.root)
+                if rel.startswith(".."):
+                    rel = os.path.basename(path)
+                dest = os.path.join(os.path.abspath(args.move_source_to), rel)
+                if os.path.exists(dest):
+                    self.display.warn("not moving %s: %s already exists" % (path, dest))
+                    self.log.write("Not moved (destination exists): %s" % path)
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(path, dest)
+                self.log.write("Moved source %s -> %s" % (path, dest))
+            except OSError as exc:
+                self.display.warn("could not handle source %s: %s" % (path, exc))
+                self.log.write("Source handling failed for %s: %s" % (path, exc))
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+class Display:
+    def __init__(self, args, total_discs: int = 0, total_bytes: int = 0):
+        self.quiet = args.quiet
+        self.verbose = args.verbose
+        self.lock = threading.Lock()
+        self.total_discs = total_discs
+        self.phases: dict[int, str] = {}
+
+    def out(self, text: str) -> None:
+        with self.lock:
+            print(text, flush=True)
+
+    def info(self, text: str) -> None:
+        if not self.quiet:
+            self.out(text)
+
+    def warn(self, text: str) -> None:
+        if not self.quiet:
+            self.out("  warning: " + text)
+
+    def command(self, cmd: list[str]) -> None:
+        if self.verbose:
+            self.out("    $ " + " ".join(shlex_quote(c) for c in cmd))
+
+    def header(self, disc: Disc) -> None:
+        self.info("[%*d/%d] %s   %s   %s" % (len(str(self.total_discs)), disc.index,
+                                           self.total_discs, disc.name, disc.kind, fmt_size(disc.size)))
+
+    def phase(self, disc: Disc, name: str, frac: float) -> None:
+        if self.phases.get(disc.index) != name:
+            self.phases[disc.index] = name
+            self.info("  %s" % name)
+
+    def result(self, disc: Disc) -> None:
+        self.out(result_line(disc))
+
+    def disc_done(self, disc: Disc) -> None:
+        pass
+
+    def clear(self) -> None:
+        pass
+
+    def start(self, total_discs: int, total_bytes: int) -> None:
+        self.total_discs = total_discs
+
+    def scan_progress(self, value) -> None:
+        pass
+
+    def scan_done(self, seen) -> None:
+        pass
+
+    def banner(self, text: str) -> None:
+        self.out(text)
+
+    def summary(self, lines: list[str]) -> None:
+        self.out("\n".join(lines))
+
+
+def result_line(disc: Disc) -> str:
+    if disc.status in (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS) and disc.chd_size:
+        text = "%s  %s  %s -> %s (%d%%)  %s" % (
+            disc.status, os.path.basename(disc.final) if disc.kind != "CHD" else show_path(disc.image),
+            fmt_size(disc.size), fmt_size(disc.chd_size),
+            round(100.0 * disc.chd_size / max(1, disc.size)), fmt_duration(disc.seconds))
+        if disc.status == OK_INTERNAL_ONLY:
+            text += "  (%s)" % disc.reason
+        return text
+    return "%s  %s: %s" % (disc.status, disc.label(), disc.reason)
+
+
+def final_summary(discs: list[Disc], elapsed: float, log_path: str | None) -> list[str]:
+    counts: dict[str, int] = {}
+    for d in discs:
+        if d.status:
+            counts[d.status] = counts.get(d.status, 0) + 1
+    lines = ["", "Summary:"]
+    lines.append("  " + (", ".join("%s: %d" % kv for kv in sorted(counts.items())) or "nothing done"))
+    failures = [d for d in discs if d.status and d.status not in SUCCESS]
+    if failures:
+        lines.append("  Problems:")
+        for d in failures:
+            lines.append("    %-22s %s: %s" % (d.status, d.label(), d.reason))
+    done = [d for d in discs if d.status in (OK, OK_INTERNAL_ONLY) and d.kind in (DVD, CD)]
+    if done:
+        src = sum(d.size for d in done)
+        chd = sum(d.chd_size for d in done)
+        lines.append("  Size: %s -> %s (saved %s, %d%%)" % (
+            fmt_size(src), fmt_size(chd), fmt_size(src - chd), round(100.0 * (src - chd) / max(1, src))))
+    lines.append("  Elapsed: %s" % fmt_duration(elapsed))
+    if log_path:
+        lines.append("  Log: %s" % log_path)
+    return lines
+
+
+def exit_code_for(discs: list[Disc]) -> int:
+    return EXIT_FAIL if any(d.status and d.status not in SUCCESS for d in discs) else EXIT_OK
+
+
+# --------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------
 
@@ -820,8 +1684,72 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def install_signal_handlers() -> None:
+    def handler(signum, frame):
+        if STATE.interrupted:
+            return
+        STATE.interrupted = signum
+        sys.stdout.write("\nInterrupted, cleaning up\u2026\n")
+        sys.stdout.flush()
+        STATE.kill_all()
+        raise Interrupted(signum)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
+def confirm(args) -> int | None:
+    """Return an exit code to stop with, or None to go on."""
+    if args.yes:
+        return None
+    if not sys.stdin.isatty():
+        print("disc2chd: standard input is not a terminal; pass -y to proceed without asking.",
+              file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        answer = input("Proceed? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Nothing done.")
+        return EXIT_USAGE
+    return None
+
+
+def run_jobs(jobs: list[Job], processor: Processor, workers: int) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(processor.run_job, job): job for job in jobs}
+        pending = set(futures)
+        try:
+            while pending:
+                done, pending = concurrent.futures.wait(pending, timeout=0.3)
+                for fut in done:
+                    exc = fut.exception()
+                    if exc is not None and not isinstance(exc, Interrupted):
+                        job = futures[fut]
+                        processor.log.write("Internal error in job %s: %r" % (
+                            job.archive or job.discs[0].image, exc))
+                        for d in job.discs:
+                            if d.status is None:
+                                processor.finish(d, FAILED_CHDMAN, "internal error: %s" % exc)
+        except Interrupted:
+            STATE.kill_all()
+            concurrent.futures.wait(pending, timeout=20)
+            raise
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    install_signal_handlers()
+    try:
+        return run(args)
+    except Interrupted as exc:
+        STATE.kill_all()
+        STATE.remove_tracked()
+        return 128 + exc.signum
+
+
+def run(args) -> int:
+    started = time.monotonic()
     deps = check_dependencies(args)
     if args.check:
         print("\n".join(dependency_report(deps)))
@@ -836,18 +1764,86 @@ def main(argv: list[str] | None = None) -> int:
             print("disc2chd: no such file or folder: %s" % p, file=sys.stderr)
             return EXIT_USAGE
     roots = [os.path.abspath(p) for p in paths]
-    files, seen = scan_paths(paths, not args.no_recursive)
-    if any(ext_of(f) in ARCHIVE_EXTS for f in files) and not deps.sevenzip.ok:
-        print("disc2chd: archives were found but 7-Zip is missing: %s"
-              % deps.sevenzip.problem, file=sys.stderr)
-        print("Install: " + install_hint(deps.os_family, "7z"), file=sys.stderr)
-        return EXIT_DEPS
-    plan = build_plan(args, deps, files, seen, roots)
-    print("\n".join(plan_summary(plan, args)))
+    display = Display(args)
+    files, seen = scan_paths(paths, not args.no_recursive, display.scan_progress)
+    display.scan_done(seen)
+
+    if args.verify_only:
+        jobs = []
+        for path in sorted(f for f in files if ext_of(f) == ".chd"):
+            disc = Disc("CHD", stem_of(path), path, [path], [os.path.getsize(path)],
+                        final=path, root=files[path])
+            jobs.append(Job(files[path], [disc], verify_chd=path))
+        plan = Plan(jobs, [j.discs[0] for j in jobs], roots, seen)
+        if not jobs:
+            print("No .chd files found.")
+            return EXIT_OK
+        print("Verifying %d CHD files (%s)" % (len(jobs), fmt_size(sum(j.discs[0].size for j in jobs))))
+    else:
+        if any(ext_of(f) in ARCHIVE_EXTS for f in files) and not deps.sevenzip.ok:
+            print("disc2chd: archives were found but 7-Zip is missing: %s"
+                  % deps.sevenzip.problem, file=sys.stderr)
+            print("Install: " + install_hint(deps.os_family, "7z"), file=sys.stderr)
+            return EXIT_DEPS
+        plan = build_plan(args, deps, files, seen, roots, display.scan_progress)
+        display.scan_done(None)
+        if not plan.discs:
+            print("No disc images found in %s." % ", ".join(show_path(r) or "." for r in roots))
+            return EXIT_OK
+        print("\n".join(plan_summary(plan, args)))
+    for root in risky_roots(roots):
+        display.banner("WARNING: scanning %s. This may cover far more than a games folder." % root)
     if args.dry_run:
-        print("\n".join(dry_run_lines(plan, deps, args)))
-    failed = any(d.status is not None and d.status not in SUCCESS for d in plan.discs)
-    return EXIT_FAIL if failed else EXIT_OK
+        if not args.verify_only:
+            print("\n".join(dry_run_lines(plan, deps, args)))
+        return exit_code_for(plan.discs)
+
+    jobs = [j for j in plan.jobs if any(d.status is None for d in j.discs)]
+    if not jobs:
+        print("\n".join(final_summary(plan.discs, time.monotonic() - started, None)))
+        return exit_code_for(plan.discs)
+    if not args.verify_only:
+        stop = confirm(args)
+        if stop is not None:
+            return stop
+
+    log = Log.open_default(args.log)
+    log.write("disc2chd %s; chdman %s %s; 7-Zip %s %s" % (
+        VERSION, deps.chdman.path, deps.chdman.version, deps.sevenzip.path, deps.sevenzip.version))
+    log.write("Arguments: %s" % " ".join(sys.argv[1:]))
+    for line in plan_summary(plan, args) if not args.verify_only else []:
+        log.write(line)
+    workspace = Workspace(args.temp_dir)
+    try:
+        if not args.verify_only:
+            clean = list(roots)
+            if args.output_dir:
+                clean.append(os.path.abspath(args.output_dir))
+            if args.temp_dir:
+                clean.append(os.path.abspath(args.temp_dir))
+            for path in clean_stale(clean, not args.no_recursive, log):
+                display.info("Removed leftover: %s" % show_path(path))
+        todo = [d for j in jobs for d in j.discs if d.status is None]
+        for n, disc in enumerate(todo, 1):
+            disc.index = n
+        display.start(len(todo), sum(d.size for d in todo))
+        keep = {d.archive for d in plan.discs if d.archive and d.status is not None}
+        processor = Processor(args, deps, display, log, workspace, keep)
+        run_jobs(jobs, processor, args.jobs)
+        display.clear()
+        summary = final_summary(plan.discs, time.monotonic() - started, log.path)
+        for line in summary:
+            log.write(line)
+        display.summary(summary)
+        return exit_code_for(plan.discs)
+    except Interrupted as exc:
+        display.clear()
+        log.write("Interrupted by signal %d; cleaning up" % exc.signum)
+        raise
+    finally:
+        STATE.remove_tracked()
+        workspace.close()
+        log.close()
 
 
 if __name__ == "__main__":
