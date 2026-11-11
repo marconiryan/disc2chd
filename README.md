@@ -23,11 +23,10 @@ Run `disc2chd --check` to see what is installed and how to install what is missi
 ## Install
 
 ```sh
-./install.sh                 # installs ~/.local/bin/disc2chd
-./install.sh --add-to-path   # also adds ~/.local/bin to PATH in your shell rc files
+./install.sh
 ```
 
-Run it again to upgrade.
+Installs the `disc2chd` command to `~/.local/bin` and, if that folder is not in your `PATH`, adds it to your shell's startup file. Open a new terminal afterwards. Run it again to upgrade.
 
 ## Usage
 
@@ -51,9 +50,10 @@ See `disc2chd --help` for all options.
 ## Uninstall
 
 ```sh
-./uninstall.sh           # keeps the logs
-./uninstall.sh --purge   # also removes the logs
+./uninstall.sh
 ```
+
+Removes the command, the `PATH` line added by the installer, and the logs.
 
 ## License
 
