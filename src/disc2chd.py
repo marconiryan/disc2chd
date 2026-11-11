@@ -237,8 +237,9 @@ DVD, CD = "DVD", "CD"
 OK = "OK"
 OK_INTERNAL_ONLY = "OK_INTERNAL_ONLY"
 SKIPPED_EXISTS = "SKIPPED_EXISTS"
-ORPHAN_BIN = "ORPHAN_BIN"
-UNSUPPORTED_CUE = "UNSUPPORTED_CUE"
+SKIPPED_NO_CUE = "SKIPPED_NO_CUE"
+SKIPPED_UNSUPPORTED = "SKIPPED_UNSUPPORTED"
+FAILED_READ = "FAILED_READ"
 FAILED_EXTRACT = "FAILED_EXTRACT"
 FAILED_MISSING_FILE = "FAILED_MISSING_FILE"
 FAILED_CHDMAN = "FAILED_CHDMAN"
@@ -250,6 +251,11 @@ FAILED_NAME_COLLISION = "FAILED_NAME_COLLISION"
 FAILED_MEMORY = "FAILED_MEMORY"
 
 SUCCESS = (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS)
+SKIPPED = (SKIPPED_NO_CUE, SKIPPED_UNSUPPORTED)   # files left alone; not failures
+
+
+def is_failure(status: str | None) -> bool:
+    return bool(status) and status.startswith("FAILED_")
 
 SMALL_ISO_BYTES = 750 * 1000 * 1000
 ARCHIVE_EXTS = (".7z", ".zip", ".rar")
@@ -379,6 +385,7 @@ class CueSheet:
     has_gaps: bool = False
     has_bom: bool = False
     problem: str | None = None
+    bad_types: list[str] = field(default_factory=list)   # unsupported FILE types
 
 
 def decode_text(data: bytes) -> str:
@@ -403,6 +410,8 @@ def parse_cue(data: bytes) -> CueSheet:
             sheet.file_line_index.append(i)
             if ftype != "BINARY":
                 bad_types.append("%s (%s)" % (name, ftype or "no type"))
+                if (ftype or "no type") not in sheet.bad_types:
+                    sheet.bad_types.append(ftype or "no type")
         elif TRACK_RE.match(line):
             sheet.tracks += 1
         elif GAP_RE.match(line):
@@ -571,7 +580,7 @@ def classify(files: list[str], view) -> list[Disc]:
         try:
             sheet = parse_cue(view.read(cue_path))
         except OSError as exc:
-            discs.append(Disc("", stem_of(cue_path), cue_path, status=UNSUPPORTED_CUE,
+            discs.append(Disc("", stem_of(cue_path), cue_path, status=FAILED_READ,
                               reason="cannot read cue: %s" % exc))
             continue
         resolved, missing, case_fixed = [], [], False
@@ -586,7 +595,8 @@ def classify(files: list[str], view) -> list[Disc]:
         disc = Disc(CD, stem_of(cue_path), cue_path, resolved, [view.size(p) for p in resolved],
                     tracks=sheet.tracks, has_gaps=sheet.has_gaps, case_fixed=case_fixed, cue=sheet)
         if sheet.problem:
-            disc.kind, disc.status, disc.reason = "", UNSUPPORTED_CUE, sheet.problem
+            detail = "/".join(sheet.bad_types) if sheet.bad_types else sheet.problem
+            disc.kind, disc.status, disc.reason = "", SKIPPED_UNSUPPORTED, "unsupported cue (%s)" % detail
         elif missing:
             disc.status = FAILED_MISSING_FILE
             disc.reason = "referenced file not found: " + ", ".join(missing)
@@ -605,8 +615,8 @@ def classify(files: list[str], view) -> list[Disc]:
                                      "Converting as DVD anyway.")
             discs.append(disc)
         elif ext == ".bin":
-            discs.append(Disc("", stem_of(path), path, status=ORPHAN_BIN,
-                              reason="not referenced by any .cue; never converted without one"))
+            discs.append(Disc("", stem_of(path), path, status=SKIPPED_NO_CUE,
+                              reason="no .cue file references it"))
     return discs
 
 
@@ -777,7 +787,8 @@ def plan_summary(plan: Plan, args) -> list[str]:
     todo = [d for d in plan.discs if d.kind and d.status is None]
     exists = [d for d in todo if os.path.exists(d.final)]
     convert = [d for d in todo if d not in exists]
-    problems = [d for d in plan.discs if d.status is not None]
+    problems = [d for d in plan.discs if is_failure(d.status)]
+    skipped = [d for d in plan.discs if d.status in SKIPPED]
     dvd = sum(1 for d in convert if d.kind == DVD)
     lines = ["Scanned %d files in %s" % (plan.files_seen, ", ".join(show_path(r) or "." for r in plan.roots))]
     lines.append("  To convert:    %d (%d DVD, %d CD), %s" % (
@@ -788,6 +799,10 @@ def plan_summary(plan: Plan, args) -> list[str]:
         counts[d.status] = counts.get(d.status, 0) + 1
     lines.append("  Problems:      %d%s" % (len(problems), (" (%s)" % ", ".join(
         "%s: %d" % kv for kv in sorted(counts.items()))) if counts else ""))
+    if skipped:
+        lines.append("  Skipped:       %d (not converted)" % len(skipped))
+        for d in skipped:
+            lines.append("    %s  %s" % (d.label(), d.reason))
     lines.append("  Source size:   %s" % fmt_size(sum(d.size for d in todo)))
     devices: dict[int, str] = {}
     for d in todo:
@@ -1663,7 +1678,7 @@ def status_color(status: str) -> str:
         return "cyan"
     if status == SKIPPED_EXISTS:
         return "blue"
-    if status in (ORPHAN_BIN, UNSUPPORTED_CUE):
+    if status in SKIPPED:
         return "yellow"
     return "red"
 
@@ -1749,8 +1764,7 @@ class Display:
     def summary(self, lines: list[str]) -> None:
         for line in lines:
             m = re.match(r"^(\s+)([A-Z_]+)(\s.*)$", line)
-            if m and m.group(2) in (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS, ORPHAN_BIN,
-                                    UNSUPPORTED_CUE) or (m and m.group(2).startswith("FAILED_")):
+            if m and (m.group(2) in SUCCESS + SKIPPED or is_failure(m.group(2))):
                 line = m.group(1) + self.paint(m.group(2), status_color(m.group(2))) + m.group(3)
             self.out(line)
 
@@ -1842,10 +1856,15 @@ def final_summary(discs: list[Disc], elapsed: float, log_path: str | None) -> li
             counts[d.status] = counts.get(d.status, 0) + 1
     lines = ["", "Summary:"]
     lines.append("  " + (", ".join("%s: %d" % kv for kv in sorted(counts.items())) or "nothing done"))
-    failures = [d for d in discs if d.status and d.status not in SUCCESS]
+    failures = [d for d in discs if is_failure(d.status)]
     if failures:
         lines.append("  Problems:")
         for d in failures:
+            lines.append("    %-22s %s: %s" % (d.status, d.label(), d.reason))
+    skipped = [d for d in discs if d.status in SKIPPED]
+    if skipped:
+        lines.append("  Skipped:")
+        for d in skipped:
             lines.append("    %-22s %s: %s" % (d.status, d.label(), d.reason))
     noted = [d for d in discs if d.notes]
     if noted:
@@ -1869,7 +1888,7 @@ def final_summary(discs: list[Disc], elapsed: float, log_path: str | None) -> li
 
 
 def exit_code_for(discs: list[Disc]) -> int:
-    return EXIT_FAIL if any(d.status and d.status not in SUCCESS for d in discs) else EXIT_OK
+    return EXIT_FAIL if any(is_failure(d.status) for d in discs) else EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -1969,7 +1988,13 @@ def install_signal_handlers() -> None:
         signal.signal(sig, handler)
 
 
-def confirm(args) -> int | None:
+def confirm_question(convert: int, existing: int) -> str:
+    if convert:
+        return "Convert %d disc%s? [y/N] " % (convert, "" if convert == 1 else "s")
+    return "Verify %d existing CHD%s? [y/N] " % (existing, "" if existing == 1 else "s")
+
+
+def confirm(args, question: str) -> int | None:
     """Return an exit code to stop with, or None to go on."""
     if args.yes:
         return None
@@ -1978,7 +2003,7 @@ def confirm(args) -> int | None:
               file=sys.stderr)
         return EXIT_USAGE
     try:
-        answer = input("Proceed? [y/N] ")
+        answer = input(question)
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
@@ -2067,7 +2092,7 @@ def run(args) -> int:
         if not args.quiet:
             print("\n".join(plan_summary(plan, args)))
         for d in plan.discs:
-            if d.status is not None:
+            if is_failure(d.status):
                 display.result(d)
     for root in risky_roots(roots):
         display.banner("WARNING: scanning %s. This may cover far more than a games folder." % root)
@@ -2078,10 +2103,12 @@ def run(args) -> int:
 
     jobs = [j for j in plan.jobs if any(d.status is None for d in j.discs)]
     if not jobs:
-        print("\n".join(final_summary(plan.discs, time.monotonic() - started, None)))
+        print("Nothing to convert.")
         return exit_code_for(plan.discs)
     if not args.verify_only:
-        stop = confirm(args)
+        pending = [d for j in jobs for d in j.discs if d.status is None]
+        existing = sum(1 for d in pending if os.path.exists(d.final))
+        stop = confirm(args, confirm_question(len(pending) - existing, existing))
         if stop is not None:
             return stop
 

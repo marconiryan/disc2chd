@@ -71,7 +71,7 @@ FAKE_OS_RELEASE = 'NAME="Test Linux"\nID=testlinux\n'
 
 SECTOR = 2048
 RAW_SECTOR = 2352
-STATUS_RE = re.compile(r"^(OK|OK_INTERNAL_ONLY|SKIPPED_EXISTS|ORPHAN_BIN|UNSUPPORTED_CUE|FAILED_[A-Z_]+)  (.*)$")
+STATUS_RE = re.compile(r"^(OK|OK_INTERNAL_ONLY|SKIPPED_[A-Z_]+|FAILED_[A-Z_]+)  (.*)$")
 
 # Names with spaces, brackets, quotes, '&', accents and a leading '-'.
 AWKWARD = "-Gämé [Disc 1] (Rev A) & 'Co'"

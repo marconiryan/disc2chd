@@ -33,8 +33,11 @@ def test_12_orphan_bin_never_passed_to_chdman(run, games, assets, chdman_wrapper
     shutil.copy(assets["data_bin"], games / "Paired.bin")
     (games / "Paired.cue").write_text(single_cue_text("Paired.bin"))
     res = run("--chdman", wrapper, cwd=games)
-    assert res.returncode == 1, res.stdout
-    assert sorted(statuses(res.stdout)) == ["OK", "ORPHAN_BIN"]
+    assert res.returncode == 0, res.stdout
+    assert statuses(res.stdout) == ["OK"]
+    assert "Lonely.bin  no .cue file references it" in res.stdout
+    summary = res.stdout.split("Summary:", 1)[1]
+    assert "SKIPPED_NO_CUE: 1" in summary
     logged = calls.read_text()
     assert "createcd" in logged
     for line in logged.splitlines():
