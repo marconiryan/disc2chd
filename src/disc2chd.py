@@ -247,6 +247,7 @@ FAILED_HASH_MISMATCH = "FAILED_HASH_MISMATCH"
 FAILED_TIMEOUT = "FAILED_TIMEOUT"
 FAILED_NO_SPACE = "FAILED_NO_SPACE"
 FAILED_NAME_COLLISION = "FAILED_NAME_COLLISION"
+FAILED_MEMORY = "FAILED_MEMORY"
 
 SUCCESS = (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS)
 
@@ -255,6 +256,16 @@ ARCHIVE_EXTS = (".7z", ".zip", ".rar")
 SCAN_EXTS = (".iso", ".cue", ".bin", ".chd") + ARCHIVE_EXTS
 TEMP_PREFIX = ".disc2chd-tmp-"
 TEMP_DIR_RE = re.compile(r"^\.disc2chd-tmp-\d+$")
+
+# Codecs without FLAC, used when chdman runs out of memory with FLAC.
+NO_FLAC_CODECS = {DVD: "lzma,zlib,huff", CD: "cdlz,cdzl"}
+NO_FLAC_WARNING = "converted without FLAC: chdman ran out of memory with FLAC"
+NO_FLAC_EXPLANATION = (
+    "note: some chdman builds leak memory with FLAC (libFLAC 1.5); to skip the failed "
+    "attempt next time, use --compression %s (or %s for CD images)."
+    % (NO_FLAC_CODECS[DVD], NO_FLAC_CODECS[CD]))
+GIB = 1 << 30
+DEFAULT_MEMORY_CAP = 4 * GIB
 
 
 def ext_of(path: str) -> str:
@@ -282,6 +293,56 @@ def fmt_duration(seconds: float) -> str:
     if m:
         return "%dm%02ds" % (m, s)
     return "%ds" % s
+
+
+def fmt_binary(n: int) -> str:
+    """Sizes given in binary units, as --max-chdman-memory takes them."""
+    for unit, scale in (("GiB", GIB), ("MiB", 1 << 20)):
+        if n >= scale:
+            return "%.1f %s" % (n / float(scale), unit)
+    return "%d KiB" % (n // 1024)
+
+
+def parse_size(text: str) -> int:
+    """'4G', '512M', '1.5GiB' or a plain byte count. Units are binary."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$", text, re.IGNORECASE)
+    if not m:
+        raise argparse.ArgumentTypeError("not a size like 4G or 512M: %r" % text)
+    scale = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m.group(2).upper()]
+    value = int(float(m.group(1)) * scale)
+    if value < 1 << 20:
+        raise argparse.ArgumentTypeError("must be at least 1M: %r" % text)
+    return value
+
+
+def mem_total() -> int | None:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def default_memory_limit(jobs: int) -> int:
+    total = mem_total()
+    if not total:
+        return DEFAULT_MEMORY_CAP
+    return min(DEFAULT_MEMORY_CAP, total // (2 * max(1, jobs)))
+
+
+def read_rss(pid: int) -> int | None:
+    """Resident memory of a process in bytes (VmRSS), or None."""
+    try:
+        with open("/proc/%d/status" % pid) as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def show_path(path: str) -> str:
@@ -373,6 +434,7 @@ class Disc:
     seconds: float = 0.0
     started: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)    # warnings shown with the result
 
     @property
     def size(self) -> int:
@@ -676,7 +738,8 @@ def build_plan(args, deps: Deps, files: dict, seen: int, roots: list[str],
     return Plan(jobs, all_discs, roots, seen)
 
 
-def chdman_create_cmd(chdman: str, kind: str, source: str, part: str, args) -> list[str]:
+def chdman_create_cmd(chdman: str, kind: str, source: str, part: str, args,
+                      compression: str | None = None) -> list[str]:
     command = "createdvd" if kind == DVD else "createcd"
     # Never hand a .bin to chdman: createcd hangs on it and createdvd
     # silently produces a wrong CHD.
@@ -686,8 +749,9 @@ def chdman_create_cmd(chdman: str, kind: str, source: str, part: str, args) -> l
     cmd = [chdman, command, "-i", source, "-o", part]
     if args.threads:
         cmd += ["-np", str(args.threads)]
-    if args.compression:
-        cmd += ["-c", args.compression]
+    compression = compression or args.compression
+    if compression:
+        cmd += ["-c", compression]
     if args.hunk_size:
         cmd += ["-hs", str(args.hunk_size)]
     return cmd
@@ -855,6 +919,9 @@ class RunResult:
     rc: int
     lines: list[str]
     nan: bool = False
+    killed: bool = False          # disc2chd itself stopped the process
+    memory: str = ""              # why the memory watchdog stopped it
+    peak_rss: int = 0
 
     @property
     def text(self) -> str:
@@ -867,11 +934,13 @@ class RunResult:
 
 
 def run_tool(cmd: list[str], deadline: float | None, log, display,
-             progress=None, tick=None) -> RunResult:
+             progress=None, tick=None, max_rss: int | None = None) -> RunResult:
     """Run a child process, streaming its \\r/\\n separated output.
 
     progress(fraction) is called for every 'NN% complete' line; tick() is
-    called about five times per second. Raises JobTimeout / Interrupted.
+    called about five times per second. With max_rss, the process group is
+    killed when the child's resident memory goes over it.
+    Raises JobTimeout / Interrupted.
     """
     log.write("  $ " + " ".join(shlex_quote(c) for c in cmd))
     display.command(cmd)
@@ -881,7 +950,10 @@ def run_tool(cmd: list[str], deadline: float | None, log, display,
                             preexec_fn=PDEATHSIG)
     STATE.add_proc(proc)
     lines: list[str] = []
-    nan = timed_out = False
+    nan = timed_out = killed = False
+    memory = ""
+    peak = 0
+    last_rss = 0.0
     buf = b""
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ)
@@ -893,7 +965,7 @@ def run_tool(cmd: list[str], deadline: float | None, log, display,
         if m:
             if "nan" in m.group(1).lower():
                 if not nan:
-                    nan = True
+                    nan = killed = True
                     kill_tree(proc)
             elif progress:
                 progress(min(1.0, float(m.group(1)) / 100.0))
@@ -904,10 +976,20 @@ def run_tool(cmd: list[str], deadline: float | None, log, display,
     try:
         while True:
             if STATE.interrupted:
+                killed = True
                 kill_tree(proc)
             if deadline is not None and not timed_out and time.monotonic() > deadline:
-                timed_out = True
+                timed_out = killed = True
                 kill_tree(proc)
+            if max_rss and not killed and time.monotonic() - last_rss >= 0.2:
+                last_rss = time.monotonic()
+                rss = read_rss(proc.pid) or 0
+                peak = max(peak, rss)
+                if rss > max_rss:
+                    killed = True
+                    memory = "chdman used %s, over the %s limit (--max-chdman-memory)" % (
+                        fmt_binary(rss), fmt_binary(max_rss))
+                    kill_tree(proc)
             if sel.select(0.2):
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
@@ -929,11 +1011,23 @@ def run_tool(cmd: list[str], deadline: float | None, log, display,
             kill_tree(proc)
             proc.wait()
         STATE.drop_proc(proc)
-    log.write("    exit %s after %s" % (proc.returncode, fmt_duration(time.monotonic() - started)))
+    log.write("    exit %s after %s%s" % (proc.returncode, fmt_duration(time.monotonic() - started),
+                                            "; peak memory %s" % fmt_binary(peak) if peak else ""))
+    if memory:
+        log.write("    stopped: " + memory)
     STATE.check()
     if timed_out:
         raise JobTimeout()
-    return RunResult(proc.returncode, lines, nan)
+    return RunResult(proc.returncode, lines, nan, killed, memory, peak)
+
+
+def memory_failure(res: RunResult) -> str:
+    """Why a chdman run counts as running out of memory, or ''."""
+    if res.memory:
+        return res.memory
+    if res.rc == -signal.SIGKILL and not res.killed:
+        return "chdman was killed by SIGKILL (the system likely ran out of memory)"
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -1253,6 +1347,9 @@ class Processor:
         self.ws = workspace
         self.keep_archives = keep_archives
         self.timeout = args.timeout * 60.0
+        self.max_rss = args.max_chdman_memory
+        self.explained = False
+        self.lock = threading.Lock()
 
     # -- helpers ----------------------------------------------------------
 
@@ -1261,7 +1358,27 @@ class Processor:
         if disc.started:
             disc.seconds = time.monotonic() - disc.started
         self.log.write("[%s] %s%s" % (status, disc.label(), (": " + reason) if reason else ""))
+        for note in disc.notes:
+            self.log.write("  warning: " + note)
         self.display.result(disc)
+
+    def explain_flac_once(self) -> None:
+        with self.lock:
+            if self.explained:
+                return
+            self.explained = True
+        self.log.write(NO_FLAC_EXPLANATION)
+        self.display.info(NO_FLAC_EXPLANATION)
+
+    def create(self, disc: Disc, source: str, part: str, deadline: float,
+               compression: str | None = None) -> RunResult:
+        cmd = chdman_create_cmd(self.chdman, disc.kind, os.path.abspath(source), part,
+                                self.args, compression)
+        t0 = time.monotonic()
+        res = run_tool(cmd, deadline, self.log, self.display,
+                       progress=self.phase_cb(disc, "convert"), max_rss=self.max_rss)
+        self.log.write("  convert took %s" % fmt_duration(time.monotonic() - t0))
+        return res
 
     def phase_cb(self, disc: Disc, name: str, total: int | None = None):
         self.display.phase(disc, name, 0.0)
@@ -1382,11 +1499,28 @@ class Processor:
                 self.log.write("  using a corrected copy of the cue: %s" % source)
             self.log.write("Converting %s (%s, %s)\n  source: %s\n  data files: %s" % (
                 disc.label(), disc.kind, fmt_size(disc.size), source, ", ".join(data_files)))
-            cmd = chdman_create_cmd(self.chdman, disc.kind, os.path.abspath(source), part, args)
-            t0 = time.monotonic()
-            res = run_tool(cmd, deadline, self.log, self.display,
-                           progress=self.phase_cb(disc, "convert"))
-            self.log.write("  convert took %s" % fmt_duration(time.monotonic() - t0))
+            res = self.create(disc, source, part, deadline)
+            memory = memory_failure(res)
+            if memory:
+                hint = "try --compression %s" % NO_FLAC_CODECS[disc.kind]
+                if args.compression:
+                    self.finish(disc, FAILED_MEMORY, "%s; %s" % (memory, hint))
+                    return
+                self.explain_flac_once()
+                self.log.write("  %s; retrying without FLAC" % memory)
+                self.display.warn("chdman ran out of memory with FLAC; retrying without FLAC")
+                remove_path(part)
+                res = self.create(disc, source, part, deadline, NO_FLAC_CODECS[disc.kind])
+                retry_problem = memory_failure(res)
+                if not retry_problem and res.nan:
+                    retry_problem = "chdman stalled"
+                if not retry_problem and (res.rc != 0 or not os.path.isfile(part)):
+                    retry_problem = "chdman exited %d: %s" % (res.rc, res.last_message())
+                if retry_problem:
+                    self.finish(disc, FAILED_MEMORY, "%s; the retry without FLAC also failed (%s); %s"
+                                % (memory, retry_problem, hint))
+                    return
+                disc.notes.append(NO_FLAC_WARNING)
             if res.nan:
                 self.finish(disc, FAILED_CHDMAN, "chdman stalled (progress showed -nan%) and was stopped")
                 return
@@ -1716,6 +1850,8 @@ def result_line(disc: Disc) -> str:
             round(100.0 * disc.chd_size / max(1, disc.size)), fmt_duration(disc.seconds))
         if disc.status == OK_INTERNAL_ONLY:
             text += "  (%s)" % disc.reason
+        for note in disc.notes:
+            text += "  warning: " + note
         return text
     return "%s  %s: %s" % (disc.status, disc.label(), disc.reason)
 
@@ -1732,6 +1868,12 @@ def final_summary(discs: list[Disc], elapsed: float, log_path: str | None) -> li
         lines.append("  Problems:")
         for d in failures:
             lines.append("    %-22s %s: %s" % (d.status, d.label(), d.reason))
+    noted = [d for d in discs if d.notes]
+    if noted:
+        lines.append("  Warnings:")
+        for d in noted:
+            for note in d.notes:
+                lines.append("    %s: %s" % (os.path.basename(d.final), note))
     done = [d for d in discs if d.status in (OK, OK_INTERNAL_ONLY) and d.kind in (DVD, CD)]
     if done:
         src = sum(d.size for d in done)
@@ -1799,6 +1941,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the comparison of the CHD against the source")
     p.add_argument("--compression", metavar="LIST",
                    help="chdman codecs (passed as -c)")
+    p.add_argument("--max-chdman-memory", metavar="SIZE", type=parse_size,
+                   help="stop chdman when its memory use goes over SIZE (e.g. 4G, 512M) and "
+                        "retry without FLAC (default: 4G or half the RAM divided by --jobs, "
+                        "whichever is smaller)")
     p.add_argument("--hunk-size", metavar="BYTES", type=positive_int,
                    help="chdman hunk size (passed as -hs)")
     p.add_argument("--threads", metavar="N", type=positive_int,
@@ -1883,6 +2029,8 @@ def run_jobs(jobs: list[Job], processor: Processor, workers: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.max_chdman_memory is None:
+        args.max_chdman_memory = default_memory_limit(args.jobs)
     install_signal_handlers()
     try:
         return run(args)
@@ -1959,6 +2107,7 @@ def run(args) -> int:
     log.write("disc2chd %s; chdman %s %s; 7-Zip %s %s" % (
         VERSION, deps.chdman.path, deps.chdman.version, deps.sevenzip.path, deps.sevenzip.version))
     log.write("Arguments: %s" % " ".join(sys.argv[1:]))
+    log.write("chdman memory limit: %s" % fmt_binary(args.max_chdman_memory))
     for line in plan_summary(plan, args) if not args.verify_only else []:
         log.write(line)
     workspace = Workspace(args.temp_dir)

@@ -61,3 +61,14 @@ def test_unsafe_archive_members():
     assert m.unsafe_member("/etc/passwd")
     assert m.unsafe_member("a/../../b.iso")
     assert not m.unsafe_member("dir/game..iso")
+
+
+def test_max_chdman_memory_parsing():
+    assert m.parse_size("4G") == 4 << 30
+    assert m.parse_size("512M") == 512 << 20
+    assert m.parse_size("1.5GiB") == 3 << 29
+    for bad in ("", "abc", "4X", "100"):
+        with pytest.raises(Exception):
+            m.parse_size(bad)
+    assert m.default_memory_limit(1) <= 4 << 30
+    assert m.default_memory_limit(64) <= m.default_memory_limit(1)

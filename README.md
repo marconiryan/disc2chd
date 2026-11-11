@@ -44,6 +44,7 @@ Common options:
 | `-o DIR` | Write the CHD files to `DIR` instead of next to the sources |
 | `--delete-source` | Delete each source after its CHD passes verification |
 | `--verify-only` | Only check existing `.chd` files |
+| `--max-chdman-memory SIZE` | Stop chdman above `SIZE` of memory (e.g. `4G`) and retry without FLAC |
 
 See `disc2chd --help` for all options.
 
