@@ -1506,17 +1506,78 @@ class Processor:
 # Output
 # --------------------------------------------------------------------------
 
+# Where each phase sits inside one disc's work, for the overall estimate.
+PHASE_SPAN = {
+    "extract": (0.0, 0.15), "convert": (0.15, 0.70), "verify": (0.70, 0.80),
+    "hash source": (0.80, 0.87), "extract for compare": (0.87, 0.95), "compare": (0.95, 1.0),
+}
+
+COLORS = {"green": "32", "cyan": "36", "blue": "34", "yellow": "33", "red": "31", "bold": "1"}
+
+
+def status_color(status: str) -> str:
+    if status == OK:
+        return "green"
+    if status == OK_INTERNAL_ONLY:
+        return "cyan"
+    if status == SKIPPED_EXISTS:
+        return "blue"
+    if status in (ORPHAN_BIN, UNSUPPORTED_CUE):
+        return "yellow"
+    return "red"
+
+
+@dataclass
+class PhaseState:
+    disc: Disc
+    name: str
+    started: float
+    frac: float = 0.0
+    step: int = 0
+
+
 class Display:
-    def __init__(self, args, total_discs: int = 0, total_bytes: int = 0):
+    """Console output: headers, live status line (or plain lines), results."""
+
+    def __init__(self, args):
         self.quiet = args.quiet
         self.verbose = args.verbose
-        self.lock = threading.Lock()
-        self.total_discs = total_discs
-        self.phases: dict[int, str] = {}
+        self.tty = sys.stdout.isatty()
+        self.live = self.tty and not args.plain
+        self.color = self.tty and not args.no_color and "NO_COLOR" not in os.environ
+        self.multi = args.jobs > 1
+        self.lock = threading.RLock()
+        self.total_discs = self.total_bytes = 0
+        self.done_discs = self.done_bytes = 0
+        self.active: dict[int, PhaseState] = {}
+        self.shown = False
+        self.last_render = 0.0
+        self.run_started = time.monotonic()
+
+    # -- low level ------------------------------------------------------------
+
+    def paint(self, text: str, color: str) -> str:
+        return "\033[%sm%s\033[0m" % (COLORS[color], text) if self.color else text
+
+    def _clear_line(self) -> None:
+        if self.shown:
+            sys.stdout.write("\r\033[K")
+            self.shown = False
 
     def out(self, text: str) -> None:
         with self.lock:
-            print(text, flush=True)
+            self._clear_line()
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+            if self.active and self.live and not self.quiet:
+                self._render(force=True)
+
+    def clear(self) -> None:
+        with self.lock:
+            self._clear_line()
+            sys.stdout.flush()
+
+    # -- messages ---------------------------------------------------------------
 
     def info(self, text: str) -> None:
         if not self.quiet:
@@ -1524,47 +1585,124 @@ class Display:
 
     def warn(self, text: str) -> None:
         if not self.quiet:
-            self.out("  warning: " + text)
+            self.out("  " + self.paint("warning:", "yellow") + " " + text)
+
+    def banner(self, text: str) -> None:
+        line = "!" * min(78, len(text) + 4)
+        self.out(self.paint("%s\n! %s !\n%s" % (line, text, line), "red"))
 
     def command(self, cmd: list[str]) -> None:
         if self.verbose:
             self.out("    $ " + " ".join(shlex_quote(c) for c in cmd))
 
-    def header(self, disc: Disc) -> None:
-        self.info("[%*d/%d] %s   %s   %s" % (len(str(self.total_discs)), disc.index,
-                                           self.total_discs, disc.name, disc.kind, fmt_size(disc.size)))
-
-    def phase(self, disc: Disc, name: str, frac: float) -> None:
-        if self.phases.get(disc.index) != name:
-            self.phases[disc.index] = name
-            self.info("  %s" % name)
-
-    def result(self, disc: Disc) -> None:
-        self.out(result_line(disc))
-
-    def disc_done(self, disc: Disc) -> None:
-        pass
-
-    def clear(self) -> None:
-        pass
-
-    def start(self, total_discs: int, total_bytes: int) -> None:
-        self.total_discs = total_discs
-
     def scan_progress(self, value) -> None:
-        pass
+        if not self.live or self.quiet:
+            return
+        text = value if isinstance(value, str) else "Scanning... %d files" % value
+        with self.lock:
+            sys.stdout.write("\r\033[K" + text)
+            sys.stdout.flush()
+            self.shown = True
 
     def scan_done(self, seen) -> None:
-        pass
-
-    def banner(self, text: str) -> None:
-        self.out(text)
+        self.clear()
 
     def summary(self, lines: list[str]) -> None:
-        self.out("\n".join(lines))
+        for line in lines:
+            m = re.match(r"^(\s+)([A-Z_]+)(\s.*)$", line)
+            if m and m.group(2) in (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS, ORPHAN_BIN,
+                                    UNSUPPORTED_CUE) or (m and m.group(2).startswith("FAILED_")):
+                line = m.group(1) + self.paint(m.group(2), status_color(m.group(2))) + m.group(3)
+            self.out(line)
+
+    # -- per disc ---------------------------------------------------------------
+
+    def start(self, total_discs: int, total_bytes: int) -> None:
+        self.total_discs, self.total_bytes = total_discs, total_bytes
+        self.run_started = time.monotonic()
+
+    def header(self, disc: Disc) -> None:
+        width = len(str(self.total_discs))
+        self.info(self.paint("[%*d/%d] %s   %s   %s" % (
+            width, disc.index, self.total_discs, disc.name, disc.kind, fmt_size(disc.size)), "bold"))
+
+    def phase(self, disc: Disc, name: str, frac: float) -> None:
+        if self.quiet:
+            return
+        with self.lock:
+            now = time.monotonic()
+            st = self.active.get(disc.index)
+            changed = st is None or st.name != name
+            if changed:
+                st = PhaseState(disc, name, now)
+                self.active[disc.index] = st
+            st.frac = max(0.0, min(1.0, frac))
+            prefix = "  [%d] " % disc.index if self.multi else "  "
+            if self.live:
+                self._render(force=changed)
+            elif changed:
+                self.out("%s%s" % (prefix, name))
+            else:
+                step = int(st.frac * 10 + 1e-9)
+                if step > st.step:
+                    st.step = step
+                    self.out("%s%s %d%%" % (prefix, name, step * 10))
+
+    def disc_done(self, disc: Disc) -> None:
+        with self.lock:
+            self.active.pop(disc.index, None)
+            self.done_discs += 1
+            self.done_bytes += disc.size
+            if not self.active:
+                self._clear_line()
+
+    def result(self, disc: Disc) -> None:
+        line = result_line(disc)
+        self.out(self.paint(disc.status, status_color(disc.status)) + line[len(disc.status):])
+
+    # -- live status line ---------------------------------------------------------
+
+    def _overall(self, now: float) -> str:
+        done = float(self.done_bytes)
+        for st in self.active.values():
+            lo, hi = PHASE_SPAN.get(st.name, (0.0, 1.0))
+            done += st.disc.size * (lo + (hi - lo) * st.frac)
+        text = "%d/%d discs  %s/%s" % (self.done_discs, self.total_discs,
+                                       fmt_size(done), fmt_size(self.total_bytes))
+        elapsed = now - self.run_started
+        if done > 0 and elapsed > 2:
+            text += "  ETA %s" % fmt_duration(elapsed * (self.total_bytes - done) / done)
+        return text
+
+    def _render(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not self.active or (not force and now - self.last_render < 0.1):
+            return
+        self.last_render = now
+        states = sorted(self.active.values(), key=lambda s: s.disc.index)
+        if len(states) == 1 and not self.multi:
+            st = states[0]
+            filled = int(st.frac * 20)
+            parts = ["  %-19s [%s%s] %5.1f%%" % (st.name, "#" * filled, "-" * (20 - filled), st.frac * 100)]
+            elapsed = now - st.started
+            if st.frac > 0.01 and elapsed > 1:
+                parts.append("%s/s" % fmt_size(st.disc.size * st.frac / elapsed))
+                parts.append("ETA %s" % fmt_duration(elapsed * (1 - st.frac) / st.frac))
+            text = "  ".join(parts)
+        else:
+            text = "  " + "  ".join("[%d] %s %d%%" % (s.disc.index, s.name, s.frac * 100) for s in states)
+        text += " | " + self._overall(now)
+        width = shutil.get_terminal_size((100, 20)).columns - 1
+        sys.stdout.write("\r\033[K" + text[:width])
+        sys.stdout.flush()
+        self.shown = True
 
 
 def result_line(disc: Disc) -> str:
+    if disc.kind == "CHD":
+        text = "%s  %s  %s  %s" % (disc.status, show_path(disc.image), fmt_size(disc.size),
+                                   fmt_duration(disc.seconds))
+        return text + (": " + disc.reason if disc.reason else "")
     if disc.status in (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS) and disc.chd_size:
         text = "%s  %s  %s -> %s (%d%%)  %s" % (
             disc.status, os.path.basename(disc.final) if disc.kind != "CHD" else show_path(disc.image),
