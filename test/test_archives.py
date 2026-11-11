@@ -68,11 +68,26 @@ def test_10_corrupted_7z(run, games, assets, tmp_path):
 
 
 def test_25_iso_and_7z_with_same_name(run, games, assets, tmp_path):
+    # The archive member's own name is used when the archive name is taken.
     shutil.copy(assets["iso"], games / "Game.iso")
     stage = tmp_path / "stage"
     stage.mkdir()
     shutil.copy(assets["iso2"], stage / "Other.iso")
     seven_zip(games / "Game.7z", stage, "Other.iso")
+    res = run(cwd=games)
+    assert res.returncode == 0, res.stdout
+    assert statuses(res.stdout) == ["OK", "OK"]
+    assert data_sha1(games / "Game.chd") == sha1_of(games / "Game.iso")
+    assert data_sha1(games / "Other.chd") == sha1_of(assets["iso2"])
+    assert leftovers(games) == []
+
+
+def test_25_name_collision_without_way_out(run, games, assets, tmp_path):
+    shutil.copy(assets["iso"], games / "Game.iso")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    shutil.copy(assets["iso2"], stage / "Game.iso")
+    seven_zip(games / "Game.7z", stage, "Game.iso")
     res = run(cwd=games)
     assert res.returncode == 1, res.stdout
     assert statuses(res.stdout).count("FAILED_NAME_COLLISION") == 2

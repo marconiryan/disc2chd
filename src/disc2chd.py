@@ -444,6 +444,7 @@ class Disc:
     status: str | None = None     # set at planning time or when finished
     reason: str = ""
     archive: str | None = None
+    alt_name: str = ""            # member name, used when the archive name collides
     root: str = ""
     index: int = 0
     chd_size: int = 0
@@ -733,7 +734,7 @@ def build_plan(args, deps: Deps, files: dict, seen: int, roots: list[str],
         for disc in discs:
             disc.archive, disc.root = archive, root
             if disc.kind and len(real) == 1:
-                disc.name = stem_of(archive)
+                disc.alt_name, disc.name = disc.name, stem_of(archive)
             disc.final = os.path.join(output_dir_for(archive, args), disc.name + ".chd")
             all_discs.append(disc)
         if real:
@@ -741,10 +742,29 @@ def build_plan(args, deps: Deps, files: dict, seen: int, roots: list[str],
 
     # Output-name collisions across all jobs (case-insensitive: the output
     # folder may be on a case-insensitive filesystem).
+    def key(path: str) -> str:
+        return os.path.normpath(path).casefold()
+
     by_name: dict[str, list[Disc]] = {}
     for disc in all_discs:
         if disc.kind and disc.status is None:
-            by_name.setdefault(os.path.normpath(disc.final).casefold(), []).append(disc)
+            by_name.setdefault(key(disc.final), []).append(disc)
+    # A single-disc archive is named after the archive. When that name is
+    # taken, fall back to the member's own name if nothing else uses it.
+    for name_key, group in list(by_name.items()):
+        for disc in list(group):
+            if len(group) < 2:
+                break
+            if not disc.alt_name or disc.alt_name.casefold() == disc.name.casefold():
+                continue
+            alt = os.path.join(os.path.dirname(disc.final), disc.alt_name + ".chd")
+            if key(alt) in by_name or os.path.exists(alt):
+                continue
+            group.remove(disc)
+            by_name[key(alt)] = [disc]
+            disc.warnings.append("named after the archive member: %s would also be written by %s"
+                                 % (os.path.basename(disc.final), ", ".join(d.label() for d in group)))
+            disc.name, disc.final = disc.alt_name, alt
     for group in by_name.values():
         if len(group) > 1:
             for disc in group:
@@ -783,53 +803,119 @@ def free_space(path: str) -> int:
         return 0
 
 
-def plan_summary(plan: Plan, args) -> list[str]:
-    todo = [d for d in plan.discs if d.kind and d.status is None]
-    exists = [d for d in todo if os.path.exists(d.final)]
-    convert = [d for d in todo if d not in exists]
-    problems = [d for d in plan.discs if is_failure(d.status)]
+def tilde(path: str) -> str:
+    home = os.path.expanduser("~").rstrip(os.sep)
+    if home and (path == home or path.startswith(home + os.sep)):
+        return "~" + path[len(home):]
+    return path
+
+
+def under_root(path: str, root: str) -> str:
+    """Path relative to the scan root, or a ~ path when it is outside."""
+    rel = os.path.relpath(path, root) if root else path
+    return tilde(os.path.abspath(path)) if rel.startswith("..") else rel
+
+
+def plan_label(d: Disc, multi: bool) -> str:
+    """'sub/Game.7z', 'Game.7z [Disc 1.iso]', or 'Game.iso -> Other.chd'."""
+    source = d.archive or d.image
+    text = under_root(source, d.root)
+    if d.archive and (multi or not d.kind):
+        text += " [%s]" % d.image
+    if d.kind:
+        base = stem_of(d.image) if d.archive and multi else stem_of(source)
+        if d.name != base:
+            text += " -> %s.chd" % d.name
+    return text
+
+
+def plan_commands(d: Disc, deps: Deps, args, first_in_archive: bool) -> list[str]:
+    def show(path: str) -> str:
+        return shlex_quote(under_root(path, d.root))
+    lines = []
+    if d.archive and first_in_archive:
+        lines.append(" ".join([os.path.basename(deps.sevenzip.path or "7z"), "x", "-y", "-bd",
+                               "-o<temp>", "--", show(d.archive)]))
+    source = d.image if not d.archive else os.path.join("<temp>", d.image)
+    cmd = chdman_create_cmd("chdman", d.kind, source, d.final + ".part", args)
+    shown = [show(c) if c in (d.image, d.final + ".part") else shlex_quote(c) for c in cmd]
+    lines.append(" ".join(shown))
+    return lines
+
+
+def plan_lines(plan: Plan, deps: Deps, args, lists: bool, commands: bool = False,
+               paint=lambda text, color: text) -> list[str]:
+    """The plan shown by --dry-run, before the confirmation, and in the log."""
+    pending = [d for d in plan.discs if d.kind and d.status is None]
+    exists = [d for d in pending if os.path.exists(d.final)]
+    convert = [d for d in pending if d not in exists]
     skipped = [d for d in plan.discs if d.status in SKIPPED]
-    dvd = sum(1 for d in convert if d.kind == DVD)
-    lines = ["Scanned %d files in %s" % (plan.files_seen, ", ".join(show_path(r) or "." for r in plan.roots))]
-    lines.append("  To convert:    %d (%d DVD, %d CD), %s" % (
-        len(convert), dvd, len(convert) - dvd, fmt_size(sum(d.size for d in convert))))
-    lines.append("  Existing CHD:  %d (will be verified, then skipped if valid)" % len(exists))
-    counts: dict[str, int] = {}
-    for d in problems:
-        counts[d.status] = counts.get(d.status, 0) + 1
-    lines.append("  Problems:      %d%s" % (len(problems), (" (%s)" % ", ".join(
-        "%s: %d" % kv for kv in sorted(counts.items()))) if counts else ""))
+    problems = [d for d in plan.discs if is_failure(d.status)]
+    per_archive: dict[str, int] = {}
+    for d in plan.discs:
+        if d.archive and d.kind:
+            per_archive[d.archive] = per_archive.get(d.archive, 0) + 1
+
+    def label(d: Disc) -> str:
+        return plan_label(d, per_archive.get(d.archive or "", 0) > 1)
+
+    def discs(n: int) -> str:
+        return "%d disc%s" % (n, "" if n == 1 else "s")
+
+    lines = ["Scanned %d files in %s" % (plan.files_seen, ", ".join(tilde(r) for r in plan.roots)), ""]
+    if convert:
+        lines.append(paint("To convert: %s, %s" % (discs(len(convert)), fmt_size(sum(d.size for d in convert))),
+                           "bold"))
+    else:
+        lines.append(paint("To convert: none", "bold"))
+    if lists:
+        seen_archives: set[str] = set()
+        for d in convert:
+            lines.append("    %-3s  %s" % (d.kind, label(d)))
+            if d.warnings:
+                lines.append("         " + paint("warning:", "yellow") + " " + "; ".join(w.rstrip(".") for w in d.warnings))
+            if commands:
+                first = bool(d.archive) and d.archive not in seen_archives
+                seen_archives.add(d.archive or "")
+                lines.extend("         $ " + c for c in plan_commands(d, deps, args, first))
+    if exists:
+        lines.append("")
+        lines.append(paint("Already converted: %d (each CHD is verified before being skipped)" % len(exists),
+                           "bold"))
+        if lists:
+            for d in exists:
+                lines.append("    " + under_root(d.final, d.root))
     if skipped:
-        lines.append("  Skipped:       %d (not converted)" % len(skipped))
+        lines.append("")
+        lines.append(paint("Skipped: %d" % len(skipped), "bold"))
         for d in skipped:
-            lines.append("    %s  %s" % (d.label(), d.reason))
-    lines.append("  Source size:   %s" % fmt_size(sum(d.size for d in todo)))
+            lines.append("    %s  %s" % (label(d), paint(d.reason, "yellow")))
+    lines.append("")
+    if problems:
+        lines.append(paint("Problems: %d" % len(problems), "bold"))
+        for d in problems:
+            lines.append("    %s  %s" % (label(d), paint(d.reason, "red")))
+    else:
+        lines.append(paint("Problems: none", "bold"))
     devices: dict[int, str] = {}
-    for d in todo:
+    for d in pending:
         out = os.path.dirname(d.final)
         probe = out if os.path.isdir(out) else os.path.dirname(out)
         try:
             devices.setdefault(os.stat(probe).st_dev, out)
         except OSError:
             pass
-    for out in list(devices.values())[:3]:
-        lines.append("  Free space:    %s in %s" % (fmt_size(free_space(out)), show_path(out) or "."))
+    outs = list(devices.values())[:3]
+    if len(outs) == 1:
+        lines.append("Free space: %s" % fmt_size(free_space(outs[0])))
+    elif outs:
+        lines.append("Free space: " + ", ".join("%s in %s" % (fmt_size(free_space(o)), tilde(o))
+                                                for o in outs))
     return lines
 
 
-def dry_run_lines(plan: Plan, deps: Deps, args) -> list[str]:
-    lines = ["Plan (dry run, nothing is written):"]
-    for d in plan.discs:
-        if not d.kind or d.status is not None:
-            continue
-        lines.append("  %-3s %s -> %s%s" % (d.kind, d.label(), show_path(d.final),
-                                             "  (exists; would be verified)" if os.path.exists(d.final) else ""))
-        src = d.image if not d.archive else os.path.join("<temp>", d.image)
-        cmd = chdman_create_cmd(deps.chdman.path, d.kind, src, d.final + ".part", args)
-        lines.append("      " + " ".join(shlex_quote(c) for c in cmd))
-        for w in d.warnings:
-            lines.append("      warning: " + w)
-    return lines
+DRY_RUN_FOOTER = "Dry run: nothing was written. Run without --dry-run to convert."
+PLAN_LIST_LIMIT = 20
 
 
 def shlex_quote(text: str) -> str:
@@ -2089,20 +2175,22 @@ def run(args) -> int:
         if not plan.discs:
             print("No disc images found in %s." % ", ".join(show_path(r) or "." for r in roots))
             return EXIT_OK
-        if not args.quiet:
-            print("\n".join(plan_summary(plan, args)))
-        for d in plan.discs:
-            if is_failure(d.status):
-                display.result(d)
+        if args.dry_run or not args.quiet:
+            pending = sum(1 for d in plan.discs if d.kind and d.status is None)
+            lists = args.dry_run or args.verbose or pending <= PLAN_LIST_LIMIT
+            print("\n".join(plan_lines(plan, deps, args, lists, args.verbose, display.paint)))
+            if args.dry_run:
+                print("\n" + DRY_RUN_FOOTER)
     for root in risky_roots(roots):
         display.banner("WARNING: scanning %s. This may cover far more than a games folder." % root)
     if args.dry_run:
-        if not args.verify_only:
-            print("\n".join(dry_run_lines(plan, deps, args)))
         return exit_code_for(plan.discs)
+    problems = [d for d in plan.discs if is_failure(d.status)]
 
     jobs = [j for j in plan.jobs if any(d.status is None for d in j.discs)]
     if not jobs:
+        for d in problems:
+            display.result(d)
         print("Nothing to convert.")
         return exit_code_for(plan.discs)
     if not args.verify_only:
@@ -2117,7 +2205,7 @@ def run(args) -> int:
         VERSION, deps.chdman.path, deps.chdman.version, deps.sevenzip.path, deps.sevenzip.version))
     log.write("Arguments: %s" % " ".join(sys.argv[1:]))
     log.write("chdman memory limit: %s" % fmt_binary(args.max_chdman_memory))
-    for line in plan_summary(plan, args) if not args.verify_only else []:
+    for line in plan_lines(plan, deps, args, True) if not args.verify_only else []:
         log.write(line)
     workspace = Workspace(args.temp_dir)
     try:
@@ -2129,6 +2217,9 @@ def run(args) -> int:
                 clean.append(os.path.abspath(args.temp_dir))
             for path in clean_stale(clean, not args.no_recursive, log):
                 display.info("Removed leftover: %s" % show_path(path))
+        for d in problems:
+            log.write("[%s] %s: %s" % (d.status, d.label(), d.reason))
+            display.result(d)
         todo = [d for j in jobs for d in j.discs if d.status is None]
         for n, disc in enumerate(todo, 1):
             disc.index = n

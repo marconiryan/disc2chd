@@ -104,6 +104,11 @@ def test_19_dry_run_writes_nothing(run, games, assets, tmp_path):
     before = snapshot(games)
     res = run("--dry-run", cwd=games)
     assert res.returncode == 0, res.stdout
+    assert "To convert: 3 discs" in res.stdout
+    assert "Dry run: nothing was written." in res.stdout
+    assert "createdvd" not in res.stdout and "createcd" not in res.stdout
+    res = run("--dry-run", "--verbose", cwd=games)
+    assert res.returncode == 0, res.stdout
     assert "createdvd" in res.stdout and "createcd" in res.stdout
     assert snapshot(games) == before
     assert not run.log_dir.exists()
