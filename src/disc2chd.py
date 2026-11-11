@@ -1543,7 +1543,7 @@ class PhaseState:
 
 
 class Display:
-    """Console output: headers, live status line (or plain lines), results."""
+    """Terminal output: headers, live status line (or plain lines), results."""
 
     def __init__(self, args):
         self.quiet = args.quiet
