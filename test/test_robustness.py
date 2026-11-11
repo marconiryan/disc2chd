@@ -204,6 +204,7 @@ def test_29_plain_output(run, games, assets, extra):
     # Own hashing reports every 10% deterministically; chdman's lines depend on its speed.
     assert "hash source 100%" in res.stdout
     assert "\033[" not in res.stdout
+    assert "ETA" not in res.stdout
 
 
 def test_extra_home_root_warning(run, games, assets):

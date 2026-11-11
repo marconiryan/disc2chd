@@ -196,6 +196,44 @@ class Runner:
         return subprocess.Popen(cmd, cwd=cwd, env=self.env(env), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+    def tty(self, *args, cwd: Path, env: dict | None = None, answer: str | None = None,
+            timeout: float = 600) -> tuple[int, str]:
+        """Run with a pseudo-terminal as stdin, stdout and stderr.
+
+        Returns (exit code, output). `answer` is typed once a [y/N] prompt shows.
+        """
+        import pty
+        import select
+        master, slave = pty.openpty()
+        cmd = [sys.executable, str(SCRIPT)] + [str(a) for a in args]
+        proc = subprocess.Popen(cmd, cwd=cwd, env=self.env(dict({"COLUMNS": "200"}, **(env or {}))),
+                                stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        out = b""
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.2)
+                if ready:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                    if answer is not None and b"[y/N]" in out:
+                        os.write(master, answer.encode() + b"\n")
+                        answer = None
+                elif proc.poll() is not None:
+                    break
+        finally:
+            os.close(master)
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        return proc.returncode, out.decode("utf-8", "replace").replace("\r\n", "\n")
+
     @property
     def log_dir(self) -> Path:
         return self.home / ".local" / "state" / "disc2chd" / "logs"

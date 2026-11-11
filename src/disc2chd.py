@@ -345,6 +345,13 @@ def read_rss(pid: int) -> int | None:
     return None
 
 
+def savings(source_bytes: int, chd_bytes: int) -> str:
+    """'saved 61%' from exact byte counts (rounded down), or 'no savings'."""
+    if chd_bytes >= source_bytes or source_bytes <= 0:
+        return "no savings"
+    return "saved %d%%" % (100 * (source_bytes - chd_bytes) // source_bytes)
+
+
 def show_path(path: str) -> str:
     """Path relative to the current directory when it is inside it."""
     try:
@@ -1545,8 +1552,8 @@ class Processor:
                             "%s appeared during conversion; not overwritten" % disc.final)
                 return
             disc.chd_size = os.path.getsize(disc.final)
-            self.log.write("  sizes: %d -> %d bytes (%.1f%%)" % (
-                disc.size, disc.chd_size, 100.0 * disc.chd_size / max(1, disc.size)))
+            self.log.write("  sizes: %d -> %d bytes, %s" % (
+                disc.size, disc.chd_size, savings(disc.size, disc.chd_size)))
             self.finish(disc, status, note)
         finally:
             remove_path(part)
@@ -1646,12 +1653,6 @@ class Processor:
 # Output
 # --------------------------------------------------------------------------
 
-# Where each phase sits inside one disc's work, for the overall estimate.
-PHASE_SPAN = {
-    "extract": (0.0, 0.15), "convert": (0.15, 0.70), "verify": (0.70, 0.80),
-    "hash source": (0.80, 0.87), "extract for compare": (0.87, 0.95), "compare": (0.95, 1.0),
-}
-
 COLORS = {"green": "32", "cyan": "36", "blue": "34", "yellow": "33", "red": "31", "bold": "1"}
 
 
@@ -1687,12 +1688,10 @@ class Display:
         self.color = self.tty and not args.no_color and "NO_COLOR" not in os.environ
         self.multi = args.jobs > 1
         self.lock = threading.RLock()
-        self.total_discs = self.total_bytes = 0
-        self.done_discs = self.done_bytes = 0
+        self.total_discs = self.done_discs = 0
         self.active: dict[int, PhaseState] = {}
         self.shown = False
         self.last_render = 0.0
-        self.run_started = time.monotonic()
 
     # -- low level ------------------------------------------------------------
 
@@ -1757,9 +1756,8 @@ class Display:
 
     # -- per disc ---------------------------------------------------------------
 
-    def start(self, total_discs: int, total_bytes: int) -> None:
-        self.total_discs, self.total_bytes = total_discs, total_bytes
-        self.run_started = time.monotonic()
+    def start(self, total_discs: int) -> None:
+        self.total_discs = total_discs
 
     def header(self, disc: Disc) -> None:
         width = len(str(self.total_discs))
@@ -1792,7 +1790,6 @@ class Display:
         with self.lock:
             self.active.pop(disc.index, None)
             self.done_discs += 1
-            self.done_bytes += disc.size
             if not self.active:
                 self._clear_line()
 
@@ -1801,18 +1798,6 @@ class Display:
         self.out(self.paint(disc.status, status_color(disc.status)) + line[len(disc.status):])
 
     # -- live status line ---------------------------------------------------------
-
-    def _overall(self, now: float) -> str:
-        done = float(self.done_bytes)
-        for st in self.active.values():
-            lo, hi = PHASE_SPAN.get(st.name, (0.0, 1.0))
-            done += st.disc.size * (lo + (hi - lo) * st.frac)
-        text = "%d/%d discs  %s/%s" % (self.done_discs, self.total_discs,
-                                       fmt_size(done), fmt_size(self.total_bytes))
-        elapsed = now - self.run_started
-        if done > 0 and elapsed > 2:
-            text += "  ETA %s" % fmt_duration(elapsed * (self.total_bytes - done) / done)
-        return text
 
     def _render(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -1823,15 +1808,10 @@ class Display:
         if len(states) == 1 and not self.multi:
             st = states[0]
             filled = int(st.frac * 20)
-            parts = ["  %-19s [%s%s] %5.1f%%" % (st.name, "#" * filled, "-" * (20 - filled), st.frac * 100)]
-            elapsed = now - st.started
-            if st.frac > 0.01 and elapsed > 1:
-                parts.append("%s/s" % fmt_size(st.disc.size * st.frac / elapsed))
-                parts.append("ETA %s" % fmt_duration(elapsed * (1 - st.frac) / st.frac))
-            text = "  ".join(parts)
+            text = "  %-19s [%s%s] %5.1f%%" % (st.name, "#" * filled, "-" * (20 - filled), st.frac * 100)
         else:
             text = "  " + "  ".join("[%d] %s %d%%" % (s.disc.index, s.name, s.frac * 100) for s in states)
-        text += " | " + self._overall(now)
+        text += " | %d/%d discs done" % (self.done_discs, self.total_discs)
         width = shutil.get_terminal_size((100, 20)).columns - 1
         sys.stdout.write("\r\033[K" + text[:width])
         sys.stdout.flush()
@@ -1844,10 +1824,9 @@ def result_line(disc: Disc) -> str:
                                    fmt_duration(disc.seconds))
         return text + (": " + disc.reason if disc.reason else "")
     if disc.status in (OK, OK_INTERNAL_ONLY, SKIPPED_EXISTS) and disc.chd_size:
-        text = "%s  %s  %s -> %s (%d%%)  %s" % (
-            disc.status, os.path.basename(disc.final) if disc.kind != "CHD" else show_path(disc.image),
-            fmt_size(disc.size), fmt_size(disc.chd_size),
-            round(100.0 * disc.chd_size / max(1, disc.size)), fmt_duration(disc.seconds))
+        text = "%s  %s  %s -> %s (%s)  %s" % (
+            disc.status, os.path.basename(disc.final), fmt_size(disc.size), fmt_size(disc.chd_size),
+            savings(disc.size, disc.chd_size), fmt_duration(disc.seconds))
         if disc.status == OK_INTERNAL_ONLY:
             text += "  (%s)" % disc.reason
         for note in disc.notes:
@@ -1878,8 +1857,11 @@ def final_summary(discs: list[Disc], elapsed: float, log_path: str | None) -> li
     if done:
         src = sum(d.size for d in done)
         chd = sum(d.chd_size for d in done)
-        lines.append("  Size: %s -> %s (saved %s, %d%%)" % (
-            fmt_size(src), fmt_size(chd), fmt_size(src - chd), round(100.0 * (src - chd) / max(1, src))))
+        if chd < src:
+            lines.append("  Size: %s -> %s (saved %s, %s)" % (
+                fmt_size(src), fmt_size(chd), fmt_size(src - chd), savings(src, chd)[len("saved "):]))
+        else:
+            lines.append("  Size: %s -> %s (no savings)" % (fmt_size(src), fmt_size(chd)))
     lines.append("  Elapsed: %s" % fmt_duration(elapsed))
     if log_path:
         lines.append("  Log: %s" % log_path)
@@ -2123,7 +2105,7 @@ def run(args) -> int:
         todo = [d for j in jobs for d in j.discs if d.status is None]
         for n, disc in enumerate(todo, 1):
             disc.index = n
-        display.start(len(todo), sum(d.size for d in todo))
+        display.start(len(todo))
         keep = {d.archive for d in plan.discs if d.archive and d.status is not None}
         processor = Processor(args, deps, display, log, workspace, keep)
         run_jobs(jobs, processor, args.jobs)
