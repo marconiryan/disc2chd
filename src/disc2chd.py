@@ -749,21 +749,30 @@ def build_plan(args, deps: Deps, files: dict, seen: int, roots: list[str],
         if disc.kind and disc.status is None:
             by_name.setdefault(key(disc.final), []).append(disc)
     # A single-disc archive is named after the archive. When that name is
-    # taken, fall back to the member's own name if nothing else uses it.
-    for name_key, group in list(by_name.items()):
-        for disc in list(group):
-            if len(group) < 2:
-                break
-            if not disc.alt_name or disc.alt_name.casefold() == disc.name.casefold():
-                continue
-            alt = os.path.join(os.path.dirname(disc.final), disc.alt_name + ".chd")
-            if key(alt) in by_name or os.path.exists(alt):
-                continue
-            group.remove(disc)
-            by_name[key(alt)] = [disc]
-            disc.warnings.append("named after the archive member: %s would also be written by %s"
-                                 % (os.path.basename(disc.final), ", ".join(d.label() for d in group)))
-            disc.name, disc.final = disc.alt_name, alt
+    # taken, it falls back to the member's own name, if no other disc wants
+    # that name. The rule only looks at the set of sources, never at files
+    # already on disk or at scan order, so every run picks the same names.
+    def alt_final(d: Disc) -> str:
+        return os.path.join(os.path.dirname(d.final), d.alt_name + ".chd")
+
+    candidates = [d for group in by_name.values() if len(group) > 1 for d in group
+                  if d.alt_name and d.alt_name.casefold() != d.name.casefold()]
+    wanted: dict[str, int] = {}
+    for d in candidates:
+        wanted[key(alt_final(d))] = wanted.get(key(alt_final(d)), 0) + 1
+    taken = set(by_name)
+    for d in candidates:
+        alt = alt_final(d)
+        if key(alt) in taken or wanted[key(alt)] > 1:
+            continue
+        others = [o for o in by_name[key(d.final)] if o is not d]
+        d.warnings.append("named after the archive member: %s would also be written by %s"
+                          % (os.path.basename(d.final), ", ".join(o.label() for o in others)))
+        d.name, d.final = d.alt_name, alt
+    by_name = {}
+    for disc in all_discs:
+        if disc.kind and disc.status is None:
+            by_name.setdefault(key(disc.final), []).append(disc)
     for group in by_name.values():
         if len(group) > 1:
             for disc in group:

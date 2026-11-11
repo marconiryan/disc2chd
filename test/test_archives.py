@@ -1,6 +1,7 @@
 """Archives (tests 7-10, 25)."""
 from __future__ import annotations
 
+import os
 import shutil
 
 from conftest import (AWKWARD, SEVENZIP_RAR, corrupt_middle, data_sha1, leftovers, make_rar4,
@@ -109,3 +110,55 @@ def test_extra_rar(run, games, assets):
         assert statuses(res.stdout) == ["FAILED_EXTRACT"]
         assert "cannot open .rar archives" in res.stdout
         assert not (games / "Packed.chd").exists()
+
+
+def test_25_renamed_outputs_are_stable_across_runs(run, games, assets, tmp_path):
+    # A loose ISO and two single-disc archives that all want Game.chd.
+    shutil.copy(assets["iso"], games / "Game.iso")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    shutil.copy(assets["iso2"], stage / "Second.iso")
+    shutil.copy(assets["iso3"], stage / "Third.iso")
+    seven_zip(games / "Game.7z", stage, "Second.iso")
+    seven_zip(games / "Game.zip", stage, "Third.iso")
+    res = run(cwd=games)
+    assert res.returncode == 0, res.stdout
+    assert statuses(res.stdout) == ["OK"] * 3
+    assert data_sha1(games / "Game.chd") == sha1_of(games / "Game.iso")
+    assert data_sha1(games / "Second.chd") == sha1_of(assets["iso2"])
+    assert data_sha1(games / "Third.chd") == sha1_of(assets["iso3"])
+    res = run(cwd=games)
+    assert res.returncode == 0, res.stdout
+    assert statuses(res.stdout) == ["SKIPPED_EXISTS"] * 3
+    assert sorted(p.name for p in games.glob("*.chd*")) == ["Game.chd", "Second.chd", "Third.chd"]
+
+
+def test_25_renaming_ignores_scan_order(games, assets, tmp_path):
+    from conftest import SEVENZIP, load_module
+    m = load_module()
+    shutil.copy(assets["iso"], games / "Game.iso")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    shutil.copy(assets["iso2"], stage / "Second.iso")
+    shutil.copy(assets["iso3"], stage / "Same.iso")
+    seven_zip(games / "Game.7z", stage, "Second.iso")
+    seven_zip(games / "Game.zip", stage, "Same.iso")
+    seven_zip(games / "Same.7z", stage, "Second.iso")
+    (games / "Game.chd").write_bytes(b"x")           # files on disk must not matter
+
+    class Args:
+        output_dir = None
+    deps = m.Deps(m.Tool("chdman", "chdman"), m.Tool("7-Zip", SEVENZIP), True)
+    names = sorted(p.name for p in games.iterdir() if p.suffix != ".chd")
+    outcomes = []
+    for order in (names, names[::-1]):
+        files = {str(games / n): str(games) for n in order}
+        plan = m.build_plan(Args(), deps, files, len(files), [str(games)])
+        outcomes.append(sorted((os.path.basename(d.archive or d.image), os.path.basename(d.final),
+                                d.status) for d in plan.discs))
+    assert outcomes[0] == outcomes[1]
+    # Game.zip falls back to Same.chd, which Same.7z already uses: no way out.
+    assert outcomes[0] == [("Game.7z", "Second.chd", None),
+                           ("Game.iso", "Game.chd", "FAILED_NAME_COLLISION"),
+                           ("Game.zip", "Game.chd", "FAILED_NAME_COLLISION"),
+                           ("Same.7z", "Same.chd", None)]
