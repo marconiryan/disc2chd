@@ -15,6 +15,7 @@ MARK_BEGIN = "# >>> disc2chd >>>"
 MARK_END = "# <<< disc2chd <<<"
 FOUND = "Installed. Open a new terminal and run: disc2chd"
 LOGIN_NOTE = "Note: login shells (SSH sessions, text consoles) do not find disc2chd yet."
+TERMINAL_NOTE = "Note: new terminal windows that start non-login shells do not find disc2chd yet."
 
 
 @pytest.fixture
@@ -87,6 +88,22 @@ def test_30_install_found_only_by_interactive_shell(sh, home):
     assert LOGIN_NOTE in res.stdout
     assert "[ -f ~/.bashrc ] && . ~/.bashrc" in res.stdout
     assert 'export PATH="%s:$PATH"' % bin_path(home).parent in res.stdout
+
+
+def test_30_install_found_only_by_login_shell(sh, home):
+    # Interactive shells stop reading ~/.bashrc before the appended block;
+    # login shells get the folder from ~/.bash_profile, which skips ~/.bashrc.
+    (home / ".bashrc").write_text("PATH=/usr/bin:/bin\nreturn\n")
+    (home / ".bash_profile").write_text('export PATH="%s:$PATH"\n' % bin_path(home).parent)
+    res = install(sh)
+    assert res.returncode == 0, res.stdout
+    assert blocks(home / ".bashrc") == 1
+    assert FOUND in res.stdout
+    assert TERMINAL_NOTE in res.stdout
+    assert LOGIN_NOTE not in res.stdout
+    assert "Add this line to ~/.bashrc" in res.stdout
+    assert 'export PATH="%s:$PATH"' % bin_path(home).parent in res.stdout
+    assert "full path" not in res.stdout
 
 
 def test_30_install_not_found_prints_manual_line(sh, home):
