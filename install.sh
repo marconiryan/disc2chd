@@ -136,7 +136,9 @@ case ":$PATH:" in
         esac ;;
 esac
 
-# Final check: does a new login + interactive shell find the command?
+# Final check, done for real in two kinds of new shell:
+#   interactive (what terminal windows usually start) and
+#   login + interactive (what SSH sessions and text consoles start).
 check_shell="$user_shell"
 case "$user_shell_name" in
     bash|zsh|fish|sh|dash|ksh|mksh|yash) ;;
@@ -147,15 +149,16 @@ if [ -z "$check_shell" ] || [ ! -x "$check_shell" ]; then
 fi
 check_name="${check_shell##*/}"
 
-found=""
-if [ -n "$check_shell" ]; then
+# shell_finds_command FLAG...: true if that new shell finds the installed command.
+shell_finds_command() {
+    local out_file check_pid watchdog runner=() result=1
+    [ -n "$check_shell" ] || return 1
     out_file="$(mktemp)"
-    runner=()
     # A new session keeps the interactive shell away from this terminal.
     if command -v setsid >/dev/null 2>&1; then
         runner=(setsid)
     fi
-    ${runner[@]+"${runner[@]}"} "$check_shell" -l -i -c 'command -v disc2chd' \
+    ${runner[@]+"${runner[@]}"} "$check_shell" "$@" -c 'command -v disc2chd' \
         </dev/null >"$out_file" 2>/dev/null &
     check_pid=$!
     ( sleep 10; kill -9 "$check_pid" 2>/dev/null ) >/dev/null 2>&1 &
@@ -164,14 +167,43 @@ if [ -n "$check_shell" ]; then
     kill "$watchdog" 2>/dev/null || true
     wait "$watchdog" 2>/dev/null || true
     if grep -qF "$dest" "$out_file"; then
-        found=1
+        result=0
     fi
     rm -f "$out_file"
-fi
+    return "$result"
+}
+
+login_fix() {
+    case "$1" in
+        bash) echo "To fix it, make ~/.bash_profile (or ~/.profile if there is no ~/.bash_profile)"
+              echo "load ~/.bashrc by adding this line to it:"
+              echo "  [ -f ~/.bashrc ] && . ~/.bashrc"
+              echo "or add the PATH line there:"
+              echo "  $path_line" ;;
+        zsh)  echo "To fix it, add this line to ~/.zprofile:"
+              echo "  $path_line" ;;
+        *)    echo "To fix it, add this line to ~/.profile:"
+              echo "  $path_line" ;;
+    esac
+}
+
+interactive_ok=""
+login_ok=""
+shell_finds_command -i && interactive_ok=1
+shell_finds_command -l -i && login_ok=1
 
 echo
-if [ -n "$found" ]; then
+if [ -n "$interactive_ok" ] || [ -n "$login_ok" ]; then
     echo "Installed. Open a new terminal and run: disc2chd"
+    if [ -n "$interactive_ok" ] && [ -z "$login_ok" ]; then
+        echo
+        echo "Note: login shells (SSH sessions, text consoles) do not find disc2chd yet."
+        login_fix "$check_name"
+    elif [ -z "$interactive_ok" ]; then
+        echo
+        echo "Note: new terminal windows that start non-login shells do not find disc2chd yet."
+        manual_instruction "$check_name"
+    fi
 else
     echo "A new $check_name shell does not find disc2chd yet."
     manual_instruction "$check_name"

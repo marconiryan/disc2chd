@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="bash is not installed")
 MARK_BEGIN = "# >>> disc2chd >>>"
 MARK_END = "# <<< disc2chd <<<"
 FOUND = "Installed. Open a new terminal and run: disc2chd"
+LOGIN_NOTE = "Note: login shells (SSH sessions, text consoles) do not find disc2chd yet."
 
 
 @pytest.fixture
@@ -67,6 +68,8 @@ def test_30_install_found_by_new_shell(sh, home, tools_path):
     assert blocks(home / ".bashrc") == 1
     assert str(bin_path(home).parent) in (home / ".bashrc").read_text()
     assert FOUND in res.stdout
+    assert LOGIN_NOTE not in res.stdout
+    assert "full path" not in res.stdout
     # A new login shell runs it through PATH, with no python3 prefix.
     login = subprocess.run([BASH, "-lic", "disc2chd --version"], cwd="/",
                            env={"HOME": str(home), "PATH": tools_path},
@@ -75,12 +78,25 @@ def test_30_install_found_by_new_shell(sh, home, tools_path):
     assert login.stdout.startswith("disc2chd "), login.stdout
 
 
+def test_30_install_found_only_by_interactive_shell(sh, home):
+    # Login shells read a ~/.bash_profile that neither loads ~/.bashrc nor keeps PATH.
+    (home / ".bash_profile").write_text("export PATH=/usr/bin:/bin\n")
+    res = install(sh)
+    assert res.returncode == 0, res.stdout
+    assert FOUND in res.stdout
+    assert LOGIN_NOTE in res.stdout
+    assert "[ -f ~/.bashrc ] && . ~/.bashrc" in res.stdout
+    assert 'export PATH="%s:$PATH"' % bin_path(home).parent in res.stdout
+
+
 def test_30_install_not_found_prints_manual_line(sh, home):
-    # The login profile resets PATH after reading ~/.bashrc.
-    (home / ".bash_profile").write_text(". ~/.bashrc\nexport PATH=/usr/bin:/bin\n")
+    # PATH is read-only in every new shell, so the added line cannot take effect.
+    (home / ".bashrc").write_text("readonly PATH\n")
+    (home / ".bash_profile").write_text(". ~/.bashrc\n")
     res = install(sh)
     assert res.returncode == 0, res.stdout
     assert FOUND not in res.stdout
+    assert blocks(home / ".bashrc") == 1
     assert 'export PATH="%s:$PATH"' % bin_path(home).parent in res.stdout
     assert "full path: %s" % bin_path(home) in res.stdout
 
