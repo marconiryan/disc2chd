@@ -309,6 +309,7 @@ class CueSheet:
     file_line_index: list[int]    # line number of each FILE line
     tracks: int = 0
     has_gaps: bool = False
+    has_bom: bool = False
     problem: str | None = None
 
 
@@ -323,7 +324,7 @@ def decode_text(data: bytes) -> str:
 
 def parse_cue(data: bytes) -> CueSheet:
     lines = decode_text(data).splitlines()
-    sheet = CueSheet(lines, [], [])
+    sheet = CueSheet(lines, [], [], has_bom=data.startswith(b"\xef\xbb\xbf"))
     bad_types = []
     for i, line in enumerate(lines):
         m = FILE_RE.match(line)
@@ -377,6 +378,12 @@ class Disc:
     def size(self) -> int:
         return sum(self.sizes)
 
+    @property
+    def rewrite_cue(self) -> bool:
+        # chdman cannot read a cue with a UTF-8 BOM, nor file names that only
+        # match with different letter case or backslashes.
+        return self.kind == CD and (self.case_fixed or bool(self.cue and self.cue.has_bom))
+
     def label(self) -> str:
         if self.archive:
             return "%s [%s]" % (show_path(self.archive), self.image)
@@ -414,7 +421,7 @@ class LooseView:
         for cand in candidates:
             path = os.path.normpath(os.path.join(base, cand))
             if os.path.isfile(path):
-                return path, False
+                return path, cand != name
         for cand in candidates:
             path = os.path.normpath(os.path.join(base, cand))
             found = self._resolve_case(path)
@@ -480,7 +487,7 @@ class ArchiveView:
             if path == ".." or path.startswith("../"):
                 continue
             if path in self.sizes:
-                return path, False
+                return path, cand != name
             matches = self.folded.get(path.casefold(), [])
             if len(matches) == 1:
                 return matches[0], True
@@ -515,8 +522,8 @@ def classify(files: list[str], view) -> list[Disc]:
             disc.status = FAILED_MISSING_FILE
             disc.reason = "referenced file not found: " + ", ".join(missing)
         elif case_fixed:
-            disc.warnings.append("the cue names files with different letter case; "
-                                 "using the matching files")
+            disc.warnings.append("the cue names files with different letter case or "
+                                 "backslashes; using the matching files")
         discs.append(disc)
     for path in files:
         ext = ext_of(path)
@@ -721,8 +728,6 @@ def plan_summary(plan: Plan, args) -> list[str]:
             pass
     for out in list(devices.values())[:3]:
         lines.append("  Free space:    %s in %s" % (fmt_size(free_space(out)), show_path(out) or "."))
-    for d in problems:
-        lines.append("  %-22s %s: %s" % (d.status, d.label(), d.reason))
     return lines
 
 
@@ -1370,10 +1375,11 @@ class Processor:
             if problem:
                 self.finish(disc, FAILED_NO_SPACE, problem)
                 return
-            if disc.kind == CD and (disc.case_fixed or not args.fast_verify):
+            if disc.kind == CD and (disc.rewrite_cue or not args.fast_verify):
                 tmp = self.ws.job_dir(out_dir)
-            if disc.kind == CD and disc.case_fixed:
+            if disc.rewrite_cue:
                 source = write_fixed_cue(disc, data_files, tmp)
+                self.log.write("  using a corrected copy of the cue: %s" % source)
             self.log.write("Converting %s (%s, %s)\n  source: %s\n  data files: %s" % (
                 disc.label(), disc.kind, fmt_size(disc.size), source, ", ".join(data_files)))
             cmd = chdman_create_cmd(self.chdman, disc.kind, os.path.abspath(source), part, args)
@@ -1928,7 +1934,11 @@ def run(args) -> int:
         if not plan.discs:
             print("No disc images found in %s." % ", ".join(show_path(r) or "." for r in roots))
             return EXIT_OK
-        print("\n".join(plan_summary(plan, args)))
+        if not args.quiet:
+            print("\n".join(plan_summary(plan, args)))
+        for d in plan.discs:
+            if d.status is not None:
+                display.result(d)
     for root in risky_roots(roots):
         display.banner("WARNING: scanning %s. This may cover far more than a games folder." % root)
     if args.dry_run:
