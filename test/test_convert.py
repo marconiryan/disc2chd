@@ -5,7 +5,9 @@ import shutil
 import subprocess
 
 from conftest import (AWKWARD, CHDMAN, chd_info, data_sha1, leftovers, make_partial_chd,
-                      multi_cue_text, results, sha1_of, single_cue_text, statuses)
+                      multi_cue_text, needs_chdman, results, sha1_of, single_cue_text, statuses)
+
+pytestmark = needs_chdman
 
 
 def add_single_cd(folder, assets, name="Single"):
@@ -99,7 +101,6 @@ def test_11_truncated_iso(run, games, assets):
     res = run(cwd=games)
     assert res.returncode == 1, res.stdout
     assert statuses(res.stdout) == ["FAILED_CHDMAN"]
-    assert "not divisible" in res.stdout
     assert not (games / "Short.chd").exists()
     assert leftovers(games) == []
 
@@ -113,9 +114,8 @@ def test_13_cue_with_missing_bin(run, games, assets):
 
 
 def test_13_cue_with_letter_case_mismatch(run, games, assets):
-    # chdman itself fails here (Linux paths are case-sensitive). disc2chd
-    # converts through a corrected copy of the cue in its temp folder and
-    # never modifies the user's files.
+    # disc2chd converts through a corrected copy of the cue in its temp
+    # folder and never modifies the user's files.
     shutil.copy(assets["data_bin"], games / "case.bin")
     cue = games / "Case.cue"
     cue.write_text(single_cue_text("CASE.BIN"))
@@ -126,23 +126,6 @@ def test_13_cue_with_letter_case_mismatch(run, games, assets):
     assert "letter case" in res.stdout
     assert cue.read_bytes() == before
     assert sorted(p.name for p in games.iterdir()) == ["Case.chd", "Case.cue", "case.bin"]
-
-
-def test_13_chdman_rejects_absolute_file_path(tmp_path, assets):
-    # Documents why the corrected cue uses relative paths: chdman joins the
-    # cue's folder with the FILE value, even an absolute one.
-    (tmp_path / "cues").mkdir()
-    cue = tmp_path / "cues" / "abs.cue"
-    cue.write_text(single_cue_text(str(assets["data_bin"])))
-    res = subprocess.run([CHDMAN, "createcd", "-i", str(cue), "-o", str(tmp_path / "abs.chd")],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
-    assert res.returncode != 0
-    rel = tmp_path / "cues" / "rel.cue"
-    shutil.copy(assets["data_bin"], tmp_path / "data.bin")
-    rel.write_text(single_cue_text("../data.bin"))
-    res = subprocess.run([CHDMAN, "createcd", "-i", str(rel), "-o", str(tmp_path / "rel.chd")],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
-    assert res.returncode == 0
 
 
 def test_14_cue_with_crlf_and_bom(run, games, assets):

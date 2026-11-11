@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import shutil
 
-from conftest import (AWKWARD, corrupt_middle, data_sha1, leftovers, multi_cue_text,
-                      seven_zip, sha1_of, single_cue_text, statuses)
+from conftest import (AWKWARD, SEVENZIP_RAR, corrupt_middle, data_sha1, leftovers, make_rar4,
+                      multi_cue_text, needs_7z, needs_chdman, seven_zip, sha1_of,
+                      single_cue_text, statuses)
+
+pytestmark = [needs_chdman, needs_7z]
 
 
 def test_07_7z_with_one_iso(run, games, assets, tmp_path):
@@ -77,10 +80,17 @@ def test_25_iso_and_7z_with_same_name(run, games, assets, tmp_path):
     assert sorted(p.name for p in games.iterdir()) == ["Game.7z", "Game.iso"]
 
 
-def test_extra_rar_without_support_fails_clearly(run, games):
-    # Not a real RAR (no RAR tool is needed): 7-Zip cannot open it either way.
-    (games / "Packed.rar").write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 4096)
+def test_extra_rar(run, games, assets):
+    # The expectation follows what the local 7-Zip can do, detected at runtime.
+    make_rar4(games / "Packed.rar", [("folder/inner.iso", assets["iso"])])
     res = run(cwd=games)
-    assert res.returncode == 1, res.stdout
-    assert statuses(res.stdout) == ["FAILED_EXTRACT"]
-    assert "7-Zip" in res.stdout
+    if SEVENZIP_RAR:
+        assert res.returncode == 0, res.stdout
+        assert statuses(res.stdout) == ["OK"]
+        assert data_sha1(games / "Packed.chd") == sha1_of(assets["iso"])
+        assert leftovers(games) == []
+    else:
+        assert res.returncode == 1, res.stdout
+        assert statuses(res.stdout) == ["FAILED_EXTRACT"]
+        assert "cannot open .rar archives" in res.stdout
+        assert not (games / "Packed.chd").exists()

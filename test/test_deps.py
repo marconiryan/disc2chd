@@ -6,9 +6,13 @@ import shutil
 
 import pytest
 
-from conftest import CHDMAN, OS_RELEASE, SEVENZIP, seven_zip, statuses, write_os_release
+from conftest import CHDMAN, OS_RELEASE, needs_chdman, statuses, write_os_release
+
+FALLBACK_CHDMAN = "/usr/bin/mame/chdman"
 
 
+@pytest.mark.skipif(os.access(FALLBACK_CHDMAN, os.X_OK),
+                    reason="%s exists, so chdman cannot be made missing" % FALLBACK_CHDMAN)
 @pytest.mark.parametrize("family", sorted(OS_RELEASE))
 def test_26_chdman_missing(run, games, assets, tmp_path, family):
     shutil.copy(assets["iso"], games / "Need.iso")
@@ -25,6 +29,7 @@ def test_26_chdman_missing(run, games, assets, tmp_path, family):
     assert OS_RELEASE[family][2] in check.stdout
 
 
+@needs_chdman
 def test_27_7zip_missing(run, games, assets, tmp_path):
     only_chdman = tmp_path / "bin"
     only_chdman.mkdir()
@@ -41,10 +46,8 @@ def test_27_7zip_missing(run, games, assets, tmp_path):
     assert check.returncode == 0
     assert "7-Zip    MISSING" in check.stdout
 
-    stage = tmp_path / "stage"
-    stage.mkdir()
-    shutil.copy(assets["iso2"], stage / "x.iso")
-    seven_zip(games / "Packed.7z", stage, "x.iso")
+    # Only the extension matters: the tool stops before opening the archive.
+    (games / "Packed.7z").write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\0" * 64)
     res = run(cwd=games, env=env)
     assert res.returncode == 3, res.stdout
     assert "sudo dnf install 7zip" in res.stdout

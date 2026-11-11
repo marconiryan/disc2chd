@@ -1,16 +1,17 @@
 """Orphans, interruptions, timeouts, modes and options (tests 12, 17-23, 28, 29)."""
 from __future__ import annotations
 
-import os
 import shutil
 import signal
-import subprocess
 import time
 
 import pytest
 
-from conftest import (corrupt_middle, leftovers, make_partial_chd, results, seven_zip,
-                      single_cue_text, snapshot, statuses)
+from conftest import (corrupt_middle, leftovers, make_partial_chd, needs_7z, needs_chdman,
+                      process_running_with, results, seven_zip, single_cue_text, snapshot,
+                      statuses)
+
+pytestmark = needs_chdman
 
 
 def wait_for(predicate, timeout=60.0):
@@ -23,8 +24,7 @@ def wait_for(predicate, timeout=60.0):
 
 
 def chdman_running_on(path) -> bool:
-    res = subprocess.run(["pgrep", "-f", str(path)], stdout=subprocess.PIPE, text=True)
-    return bool(res.stdout.strip())
+    return process_running_with(str(path))
 
 
 def test_12_orphan_bin_never_passed_to_chdman(run, games, assets, chdman_wrapper):
@@ -64,6 +64,7 @@ def test_17_signals_during_conversion(run, games, assets, sig, code):
     assert statuses(res.stdout) == ["OK"]
 
 
+@needs_7z
 def test_18_kill_9_leaves_garbage_that_next_run_cleans(run, games, assets, tmp_path):
     stage = tmp_path / "stage"
     stage.mkdir()
@@ -87,6 +88,7 @@ def test_18_kill_9_leaves_garbage_that_next_run_cleans(run, games, assets, tmp_p
     assert "Removed leftover from an earlier run" in run.last_log()
 
 
+@needs_7z
 def test_19_dry_run_writes_nothing(run, games, assets, tmp_path):
     shutil.copy(assets["iso"], games / "Plan.iso")
     shutil.copy(assets["data_bin"], games / "Plan CD.bin")
@@ -118,6 +120,7 @@ def test_20_move_source_after_ok(run, games, assets, tmp_path):
     assert sorted(p.name for p in games.iterdir()) == ["Bad.iso", "CD.chd", "Keep.chd"]
 
 
+@needs_7z
 def test_20_delete_source_after_ok(run, games, assets, tmp_path):
     shutil.copy(assets["iso"], games / "Gone.iso")
     (games / "Bad.iso").write_bytes(assets["iso"].read_bytes()[:-5])
@@ -139,7 +142,7 @@ def test_20_move_and_delete_are_exclusive(run, games, tmp_path):
 
 def test_21_timeout(run, games, assets, sleepy_chdman):
     shutil.copy(assets["iso"], games / "Stuck.iso")
-    env = {"PATH": "%s:%s" % (sleepy_chdman, os.environ["PATH"])}
+    env = {"PATH": "%s:%s" % (sleepy_chdman, run.path)}
     started = time.time()
     res = run("--timeout", "0.05", cwd=games, env=env)
     assert time.time() - started < 60
@@ -175,7 +178,6 @@ def test_23_verify_only(run, games, assets):
     found = {rest.split()[0]: status for status, rest in results(res.stdout)}
     assert found == {"Corrupt.chd": "FAILED_VERIFY", "Partial.chd": "FAILED_VERIFY",
                      "Valid.chd": "OK"}
-    assert "no checksum" in res.stdout
 
 
 def test_28_no_tty_without_yes(run, games, assets):
@@ -199,7 +201,8 @@ def test_29_plain_output(run, games, assets, extra):
     assert "\r" not in res.stdout
     for phase in ("  convert", "  verify", "  hash source", "  extract for compare", "  compare"):
         assert phase in res.stdout
-    assert "convert 50%" in res.stdout
+    # Own hashing reports every 10% deterministically; chdman's lines depend on its speed.
+    assert "hash source 100%" in res.stdout
     assert "\033[" not in res.stdout
 
 

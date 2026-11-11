@@ -1,4 +1,17 @@
-"""Synthetic fixtures for the disc2chd tests. Nothing here touches real data."""
+"""Synthetic fixtures for the disc2chd tests. Nothing here touches real data.
+
+How to run the tests
+    python3 -m pip install pytest      (or use your distro's pytest package)
+    python3 -m pytest test             from the repository root
+
+    Needs Python 3.10+ and bash. Tests that need chdman, 7-Zip, zsh or fish are
+    skipped, with the reason shown by `pytest -rs`, when those are not installed.
+    Every run uses a temporary HOME, a fake os-release and an explicit PATH.
+
+    DISC2CHD_PROBES=1 python3 -m pytest test/test_chdman_probes.py
+        also runs optional probes of raw chdman behavior. They describe the chdman
+        version they were written against and may fail on other versions.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -7,17 +20,54 @@ import random
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "disc2chd.py"
-CHDMAN = shutil.which("chdman") or "/usr/bin/mame/chdman"
+
+
+def _find_chdman() -> str | None:
+    found = shutil.which("chdman")
+    if found:
+        return found
+    fallback = "/usr/bin/mame/chdman"
+    return fallback if os.access(fallback, os.X_OK) else None
+
+
+CHDMAN = _find_chdman()
 SEVENZIP = next((shutil.which(n) for n in ("7z", "7zz", "7za") if shutil.which(n)), None)
+BASH = shutil.which("bash")
+ZSH = shutil.which("zsh")
+FISH = shutil.which("fish")
+# The interpreter running the tests, without a virtualenv wrapper.
+PYTHON = os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable)
+
+
+def _sevenzip_has_rar() -> bool:
+    if not SEVENZIP:
+        return False
+    res = subprocess.run([SEVENZIP, "i"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    formats = res.stdout.split("Formats:", 1)[-1].split("Codecs:", 1)[0]
+    return bool(re.search(r"\sRar5?\s", formats))
+
+
+SEVENZIP_RAR = _sevenzip_has_rar()
+
+needs_chdman = pytest.mark.skipif(CHDMAN is None, reason="chdman is not installed")
+needs_7z = pytest.mark.skipif(SEVENZIP is None, reason="7-Zip (7z, 7zz or 7za) is not installed")
+needs_zsh = pytest.mark.skipif(ZSH is None, reason="zsh is not installed")
+needs_fish = pytest.mark.skipif(FISH is None, reason="fish is not installed")
+probes = pytest.mark.skipif(os.environ.get("DISC2CHD_PROBES") != "1",
+                            reason="optional chdman probe; set DISC2CHD_PROBES=1 to run")
+
+FAKE_OS_RELEASE = 'NAME="Test Linux"\nID=testlinux\n'
 
 SECTOR = 2048
 RAW_SECTOR = 2352
@@ -98,14 +148,38 @@ def assets(tmp_path_factory) -> dict:
 # Running the tool
 # --------------------------------------------------------------------------
 
+@pytest.fixture(scope="session")
+def tools_path(tmp_path_factory) -> str:
+    """An explicit PATH: symlinks to the detected tools, then the system folders."""
+    d = tmp_path_factory.mktemp("tools-bin")
+    for tool in (CHDMAN, SEVENZIP):
+        if tool:
+            os.symlink(tool, d / os.path.basename(tool))
+    os.symlink(PYTHON, d / "python3")
+    return "%s:/usr/bin:/bin" % d
+
+
+@pytest.fixture(scope="session")
+def fake_os_release(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("os") / "os-release"
+    path.write_text(FAKE_OS_RELEASE)
+    return path
+
+
+def base_env(home: Path, path: str, os_release: Path) -> dict:
+    """The only environment the tool and scripts see in tests."""
+    return {"HOME": str(home), "PATH": path, "LANG": "C.UTF-8",
+            "DISC2CHD_OS_RELEASE": str(os_release)}
+
+
 class Runner:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, path: str, os_release: Path):
         self.home = home
+        self.path = path
+        self.os_release = os_release
 
     def env(self, extra: dict | None = None) -> dict:
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("DISC2CHD_", "XDG_")) and k != "NO_COLOR"}
-        env["HOME"] = str(self.home)
+        env = base_env(self.home, self.path, self.os_release)
         if extra:
             env.update(extra)
         return env
@@ -139,8 +213,8 @@ def home(tmp_path) -> Path:
 
 
 @pytest.fixture
-def run(home) -> Runner:
-    return Runner(home)
+def run(home, tools_path, fake_os_release) -> Runner:
+    return Runner(home, tools_path, fake_os_release)
 
 
 @pytest.fixture
@@ -218,6 +292,44 @@ def make_partial_chd(source_iso: Path, out: Path, delay: float = 2.0) -> Path:
     proc.wait()
     assert out.exists()
     return out
+
+
+def make_rar4(archive: Path, files: list[tuple[str, Path]]) -> Path:
+    """Write a RAR 4 archive with stored (uncompressed) members.
+
+    No RAR tool is needed. Members use Windows-style paths, as WinRAR writes them.
+    """
+    def block(htype: int, flags: int, body: bytes) -> bytes:
+        data = struct.pack("<BHH", htype, flags, 7 + len(body)) + body
+        return struct.pack("<H", zlib.crc32(data) & 0xFFFF) + data
+
+    dostime = ((2026 - 1980) << 25) | (1 << 21) | (1 << 16)
+    with open(archive, "wb") as out:
+        out.write(b"Rar!\x1a\x07\x00")
+        out.write(block(0x73, 0, struct.pack("<HI", 0, 0)))
+        for name, src in files:
+            data = Path(src).read_bytes()
+            raw = name.replace("/", "\\").encode("utf-8")
+            body = struct.pack("<IIBIIBBHI", len(data), len(data), 2, zlib.crc32(data) & 0xFFFFFFFF,
+                               dostime, 20, 0x30, len(raw), 0x20) + raw
+            out.write(block(0x74, 0x8000, body))
+            out.write(data)
+        out.write(block(0x7B, 0x4000, b""))
+    return archive
+
+
+def process_running_with(text: str) -> bool:
+    """True if any process has `text` in its command line (reads /proc)."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                if text.encode() in fh.read():
+                    return True
+        except OSError:
+            pass
+    return False
 
 
 def snapshot(folder: Path) -> dict:
